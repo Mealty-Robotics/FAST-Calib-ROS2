@@ -37,7 +37,10 @@ public:
         string image_path = params.image_path;
         string lidar_topic = params.lidar_topic;
 
-        img_input_ = cv::imread(params.image_path, cv::IMREAD_UNCHANGED);
+        // Camera projection and ROS bgr8 messages both require 8-bit BGR.
+        // IMREAD_UNCHANGED preserves PNG alpha, producing a four-byte stride
+        // that RViz rejects when the published encoding says three bytes.
+        img_input_ = cv::imread(params.image_path, cv::IMREAD_COLOR);
         if (img_input_.empty()) 
         {
             std::string msg = "Loading the image " + image_path + " failed";

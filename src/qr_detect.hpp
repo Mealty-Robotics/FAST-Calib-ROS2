@@ -8,8 +8,16 @@ which is included as part of this source code package.
 #ifndef QR_DETECT_HPP
 #define QR_DETECT_HPP
 
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
 #include <cv_bridge/cv_bridge.hpp>
+#else
+#include <cv_bridge/cv_bridge.h>
+#endif
+#if __has_include(<image_geometry/pinhole_camera_model.hpp>)
 #include <image_geometry/pinhole_camera_model.hpp>
+#else
+#include <image_geometry/pinhole_camera_model.h>
+#endif
 #include <rclcpp/rclcpp.hpp>
 #include <opencv2/aruco.hpp>
 #include <opencv2/opencv.hpp>
@@ -41,17 +49,17 @@ class QRDetect
       min_detected_markers_ = params.min_detected_markers;
       
       // Initialize camera matrix
-      cameraMatrix_ = (cv::Mat_<float>(3, 3) << params.fx, 0, params.cx,
+      cameraMatrix_ = (cv::Mat_<double>(3, 3) << params.fx, 0, params.cx,
                                                 0, params.fy, params.cy,
                                                 0,         0,        1);
                                                 
       // Initialize distortion coefficients
-      distCoeffs_ = (cv::Mat_<float>(1, 5) << params.k1, params.k2, params.p1, params.p2, 0);
+      distCoeffs_ = (cv::Mat_<double>(1, 5) << params.k1, params.k2, params.p1, params.p2, params.k3);
 
       // Initialize QR dictionary
       dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
 
-      qr_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("qr_cloud", 1);
+      qr_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("qr_cloud", rclcpp::QoS(1).reliable().transient_local());
     }
 
     cv::Point2f projectPointDist(cv::Point3f pt_cv, const cv::Mat intrinsics, const cv::Mat distCoeffs) 
@@ -98,7 +106,8 @@ class QRDetect
     }
 
     void detect_qr(cv::Mat &image, pcl::PointCloud<pcl::PointXYZ>::Ptr centers_cloud) 
-    {      
+    {
+      centers_cloud->clear();
       // Convert image to proper format for ArUco detection
       cv::Mat processedImage;
       if (image.type() == CV_8UC1) {
@@ -204,7 +213,6 @@ class QRDetect
       {
         // Estimate 3D position of the markers
         std::vector<cv::Vec3d> rvecs, tvecs;
-        cv::Vec3f rvec_sin, rvec_cos;
         cv::aruco::estimatePoseSingleMarkers(corners, marker_size_, cameraMatrix_,
                                             distCoeffs_, rvecs, tvecs);
 
@@ -212,67 +220,65 @@ class QRDetect
         for (size_t i = 0; i < ids.size(); i++) {
           cv::drawFrameAxes(imageCopy_, cameraMatrix_, distCoeffs_, rvecs[i],
                               tvecs[i], 0.1);
-
-          // Accumulate pose for initial guess
-          tvec[0] += tvecs[i][0];
-          tvec[1] += tvecs[i][1];
-          tvec[2] += tvecs[i][2];
-          rvec_sin[0] += sin(rvecs[i][0]);
-          rvec_sin[1] += sin(rvecs[i][1]);
-          rvec_sin[2] += sin(rvecs[i][2]);
-          rvec_cos[0] += cos(rvecs[i][0]);
-          rvec_cos[1] += cos(rvecs[i][1]);
-          rvec_cos[2] += cos(rvecs[i][2]);
         }
-
-        // Compute average pose
-        tvec = tvec / static_cast<int>(ids.size());
-        rvec_sin = rvec_sin / static_cast<int>(ids.size());
-        rvec_cos = rvec_cos / static_cast<int>(ids.size());
-        rvec[0] = atan2(rvec_sin[0], rvec_cos[0]);
-        rvec[1] = atan2(rvec_sin[1], rvec_cos[1]);
-        rvec[2] = atan2(rvec_sin[2], rvec_cos[2]);
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr candidates_cloud(new pcl::PointCloud<pcl::PointXYZ>);
 
         // Estimate 3D position of the board using detected markers
-    #if (CV_MAJOR_VERSION == 3 && CV_MINOR_VERSION <= 2) || CV_MAJOR_VERSION < 3
-        int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix_,
-                                                distCoeffs_, rvec, tvec);
-    #else
-        int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix_,
-                                                distCoeffs_, rvec, tvec, true);
-    #endif
+        const int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix_,
+                                                      distCoeffs_, rvec, tvec);
+
+        if (valid < min_detected_markers_ || !std::isfinite(cv::norm(rvec)) ||
+            !std::isfinite(cv::norm(tvec)) || tvec[2] <= 0.0) {
+          RCLCPP_ERROR(node_->get_logger(), "Unable to estimate a valid calibration board pose.");
+          return;
+        }
+        double corner_error_squared = 0.0;
+        std::size_t corner_count = 0;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+          const auto found = std::find(boardIds.begin(), boardIds.end(), ids[i]);
+          if (found == boardIds.end()) continue;
+          std::vector<cv::Point2f> projected;
+          cv::projectPoints(boardCorners[std::distance(boardIds.begin(), found)],
+              rvec, tvec, cameraMatrix_, distCoeffs_, projected);
+          for (std::size_t j = 0; j < projected.size(); ++j) {
+            const cv::Point2f delta = projected[j] - corners[i][j];
+            corner_error_squared += delta.dot(delta);
+            ++corner_count;
+          }
+        }
+        RCLCPP_INFO(node_->get_logger(), "ArUco corner reprojection RMSE: %.3f px (%zu corners).",
+            std::sqrt(corner_error_squared / corner_count), corner_count);
 
         cv::drawFrameAxes(imageCopy_, cameraMatrix_, distCoeffs_, rvec, tvec, 0.2);
 
         // Build transformation matrix to calibration target axis
-        cv::Mat R(3, 3, cv::DataType<float>::type);
+        cv::Mat R;
         cv::Rodrigues(rvec, R);
 
-        cv::Mat t = cv::Mat::zeros(3, 1, CV_32F);
-        t.at<float>(0) = tvec[0];
-        t.at<float>(1) = tvec[1];
-        t.at<float>(2) = tvec[2];
+        cv::Mat t = cv::Mat::zeros(3, 1, CV_64F);
+        t.at<double>(0) = tvec[0];
+        t.at<double>(1) = tvec[1];
+        t.at<double>(2) = tvec[2];
 
-        cv::Mat board_transform = cv::Mat::eye(3, 4, CV_32F);
+        cv::Mat board_transform = cv::Mat::eye(3, 4, CV_64F);
         R.copyTo(board_transform.rowRange(0, 3).colRange(0, 3));
         t.copyTo(board_transform.rowRange(0, 3).col(3));
 
         // Compute coordinates of circle centers
         for (size_t i = 0; i < boardCircleCenters.size(); ++i) {
-          cv::Mat mat = cv::Mat::zeros(4, 1, CV_32F);
-          mat.at<float>(0, 0) = boardCircleCenters[i].x;
-          mat.at<float>(1, 0) = boardCircleCenters[i].y;
-          mat.at<float>(2, 0) = boardCircleCenters[i].z;
-          mat.at<float>(3, 0) = 1.0;
+          cv::Mat mat = cv::Mat::zeros(4, 1, CV_64F);
+          mat.at<double>(0, 0) = boardCircleCenters[i].x;
+          mat.at<double>(1, 0) = boardCircleCenters[i].y;
+          mat.at<double>(2, 0) = boardCircleCenters[i].z;
+          mat.at<double>(3, 0) = 1.0;
 
           // Transform center to target coords
           cv::Mat mat_qr = board_transform * mat;
           cv::Point3f center3d;
-          center3d.x = mat_qr.at<float>(0, 0);
-          center3d.y = mat_qr.at<float>(1, 0);
-          center3d.z = mat_qr.at<float>(2, 0);
+          center3d.x = mat_qr.at<double>(0, 0);
+          center3d.y = mat_qr.at<double>(1, 0);
+          center3d.z = mat_qr.at<double>(2, 0);
 
           // Draw center (DEBUG)
           cv::Point2f uv;

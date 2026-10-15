@@ -44,9 +44,11 @@ using namespace pcl;
 // Parameters structure
 struct Params {
   double x_min, x_max, y_min, y_max, z_min, z_max;
-  double fx, fy, cx, cy, k1, k2, p1, p2;
+  double fx, fy, cx, cy, k1, k2, p1, p2, k3;
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius;
+  int min_points_per_voxel;
+  double plane_distance_threshold;
   int min_detected_markers;
   string image_path;
   string bag_path;
@@ -67,6 +69,7 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
   node->declare_parameter("k2", 0.10996870793601);
   node->declare_parameter("p1", 0.000157303079833973);
   node->declare_parameter("p2", 0.000544930726278493);
+  node->declare_parameter("k3", 0.0);
   node->declare_parameter("marker_size", 0.2);
   node->declare_parameter("delta_width_qr_center", 0.55);
   node->declare_parameter("delta_height_qr_center", 0.35);
@@ -74,6 +77,8 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
   node->declare_parameter("delta_height_circles", 0.4);
   node->declare_parameter("min_detected_markers", 3);
   node->declare_parameter("circle_radius", 0.12);
+  node->declare_parameter("min_points_per_voxel", 1);
+  node->declare_parameter("plane_distance_threshold", 0.01);
   node->declare_parameter("image_path", std::string("/path/to/image.png"));
   node->declare_parameter("bag_path", std::string("/path/to/input.bag"));
   node->declare_parameter("lidar_topic", std::string("/livox/lidar"));
@@ -95,6 +100,7 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
     params.k2 = node->get_parameter("k2").as_double();
     params.p1 = node->get_parameter("p1").as_double();
     params.p2 = node->get_parameter("p2").as_double();
+    params.k3 = node->get_parameter("k3").as_double();
     params.marker_size = node->get_parameter("marker_size").as_double();
     params.delta_width_qr_center = node->get_parameter("delta_width_qr_center").as_double();
     params.delta_height_qr_center = node->get_parameter("delta_height_qr_center").as_double();
@@ -102,6 +108,8 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
     params.delta_height_circles = node->get_parameter("delta_height_circles").as_double();
     params.min_detected_markers = node->get_parameter("min_detected_markers").as_int();
     params.circle_radius = node->get_parameter("circle_radius").as_double();
+    params.min_points_per_voxel = node->get_parameter("min_points_per_voxel").as_int();
+    params.plane_distance_threshold = node->get_parameter("plane_distance_threshold").as_double();
     params.image_path = node->get_parameter("image_path").as_string();
     params.bag_path = node->get_parameter("bag_path").as_string();
     params.lidar_topic = node->get_parameter("lidar_topic").as_string();
@@ -195,7 +203,7 @@ void projectPointCloudToImage(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
     Eigen::Vector4f transformed_point = transformation * homogeneous_point;
 
     // Skip points behind the camera
-    if (transformed_point(2) < 0) continue;
+    if (!transformed_point.allFinite() || transformed_point(2) <= 0.001f) continue;
 
     // Project the point to the image plane
     objectPoints[0] = cv::Point3f(transformed_point(0), transformed_point(1), transformed_point(2));
@@ -223,26 +231,25 @@ void projectPointCloudToImage(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
   }
 }
 
-void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transformation, 
-     const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& colored_cloud, const cv::Mat& img_input)
+// Coordinates in the standard frame (+X forward, +Y left, +Z up) -> raw
+// mounting coordinates (+Z forward, +X down, +Y left). Both origins coincide.
+Eigen::Matrix4f standardToRawLidar()
 {
-  if(colored_cloud->empty()) 
-  {
-    std::cerr << BOLDRED << "[saveCalibrationResults] Colored point cloud is empty!" << RESET << std::endl;
-    return;
-  }
-  
-  std::string outputDir = params.output_path;
-  if (outputDir.back() != '/') outputDir += '/';
+  Eigen::Matrix4f result = Eigen::Matrix4f::Identity();
+  result.block<3, 3>(0, 0) << 0, 0, -1,
+                            0, 1,  0,
+                            1, 0,  0;
+  return result;
+}
 
-  // Create output directory if it doesn't exist
-  std::filesystem::create_directories(outputDir);
-
-  // Save calibration parameters
-  std::ofstream outFile(outputDir + "calib_result.txt");
-  if (outFile.is_open()) 
+void saveCalibrationParameters(const Params& params, const Eigen::Matrix4f& transformation,
+    const cv::Mat& img_input, const std::string& output_file, const std::string& source_frame)
+{
+  std::ofstream outFile(output_file);
+  if (outFile.is_open())
   {
     outFile << "# FAST-LIVO2 calibration format\n";
+    outFile << "# Maps " << source_frame << " coordinates to camera optical coordinates\n";
     outFile << "cam_model: Pinhole\n";
     outFile << "cam_width: " << img_input.cols << "\n";
     outFile << "cam_height: " << img_input.rows << "\n";
@@ -255,6 +262,7 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
     outFile << "cam_d1: " << params.k2 << "\n";
     outFile << "cam_d2: " << params.p1 << "\n";
     outFile << "cam_d3: " << params.p2 << "\n";
+    outFile << "cam_d4: " << params.k3 << "\n";
 
     outFile << "\nRcl: [" << std::fixed << std::setprecision(6);
     outFile << std::setw(10) << transformation(0, 0) << ", " << std::setw(10) << transformation(0, 1) << ", " << std::setw(10) << transformation(0, 2) << ",\n";
@@ -265,23 +273,46 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
     outFile << std::setw(10) << transformation(0, 3) << ", " << std::setw(10) << transformation(1, 3) << ", " << std::setw(10) << transformation(2, 3) << "]\n";
 
     outFile.close();
-    std::cout << BOLDYELLOW << "[Result] Calibration results saved to " << BOLDWHITE << outputDir << "calib_result.txt" << RESET << std::endl;
-  } 
+    std::cout << BOLDYELLOW << "[Result] Calibration results saved to " << BOLDWHITE << output_file << RESET << std::endl;
+  }
   else
   {
-    std::cerr << BOLDRED << "[Error] Failed to open calib_result.txt for writing!" << RESET << std::endl;
+    std::cerr << BOLDRED << "[Error] Failed to open calibration file: " << output_file << RESET << std::endl;
   }
-  
+
+}
+
+void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transformation,
+     const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& colored_cloud, const cv::Mat& img_input,
+     const Eigen::Matrix4f& standard_transformation)
+{
+  if(colored_cloud->empty())
+  {
+    std::cerr << BOLDRED << "[saveCalibrationResults] Colored point cloud is empty!" << RESET << std::endl;
+    return;
+  }
+
+  std::string outputDir = params.output_path;
+  if (outputDir.back() != '/') outputDir += '/';
+
+  // Create output directory if it doesn't exist
+  std::filesystem::create_directories(outputDir);
+
+  saveCalibrationParameters(params, transformation, img_input,
+      outputDir + "calib_result.txt", "calib_lidar (raw)");
+  saveCalibrationParameters(params, standard_transformation, img_input,
+      outputDir + "calib_result_standard.txt", "calib_lidar_standard (+X forward, +Y left, +Z up)");
+
   // Save colored point cloud
-  if (pcl::io::savePCDFileASCII(outputDir + "colored_cloud.pcd", *colored_cloud) == 0) 
+  if (pcl::io::savePCDFileASCII(outputDir + "colored_cloud.pcd", *colored_cloud) == 0)
   {
     std::cout << BOLDYELLOW << "[Result] Saved colored point cloud to: " << BOLDWHITE << outputDir << "colored_cloud.pcd" << RESET << std::endl;
-  } 
-  else 
+  }
+  else
   {
     std::cerr << BOLDRED << "[Error] Failed to save colored point cloud to " << outputDir << "colored_cloud.pcd" "!" << RESET << std::endl;
   }
- 
+
   // Save detection image
   if (cv::imwrite(outputDir + "qr_detect.png", img_input)) {
     std::cout << BOLDYELLOW << "[Result] Saved QR detection image to: " << BOLDWHITE << outputDir << "qr_detect.png" << RESET << std::endl;
@@ -300,10 +331,12 @@ void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc, pcl::PointCloud<
     std::cerr << BOLDRED << "[sortPatternCenters] Number of " << axis_mode << " center points to be sorted is not 4." << RESET << std::endl;
     return;
   }
-  if (v->empty()) {
-    v->clear();
-    v->reserve(4);
-  }
+  v->clear();
+  v->reserve(4);
+
+  // Work on a copy: the mounting conversion is only for correspondence ordering.
+  // Both the caller's input and the centers passed to SVD keep sensor coordinates.
+  pc.reset(new pcl::PointCloud<pcl::PointXYZ>(*pc));
 
   // Check axis mode
   bool is_lidar_mode = (axis_mode == "lidar");
@@ -312,9 +345,9 @@ void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc, pcl::PointCloud<
   {
     for (auto& point : pc->points) 
     {
-      float x_new = -point.y;   // LiDAR Y → 相机 -X
-      float y_new = -point.z;   // LiDAR Z → 相机 -Y
-      float z_new = point.x;    // LiDAR X → 相机  Z
+      float x_new = -point.y;  // LiDAR +Y left -> optical -X
+      float y_new =  point.x;  // LiDAR +X down -> optical +Y
+      float z_new =  point.z;  // LiDAR +Z forward -> optical +Z
 
       point.x = x_new;
       point.y = y_new;
@@ -331,9 +364,9 @@ void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc, pcl::PointCloud<
   pt < pc->points.end(); pt++, index++) 
   {
     pcl::PointXYZ spherical_center;
-    spherical_center.x = atan2(pt->y, pt->x);  // Horizontal
+    spherical_center.x = atan2(pt->x, pt->z);  // Optical horizontal bearing
     spherical_center.y =
-    atan2(sqrt(pt->x * pt->x + pt->y * pt->y), pt->z);  // Vertical
+    atan2(pt->y, std::hypot(pt->x, pt->z));  // Optical elevation: smaller is higher
     spherical_center.z =
     sqrt(pt->x * pt->x + pt->y * pt->y + pt->z * pt->z);  // Range
     spherical_centers->push_back(spherical_center);
@@ -373,17 +406,8 @@ void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc, pcl::PointCloud<
   int lefttop_pt = top_pt;
   int righttop_pt = top_pt2;
 
-  if (spherical_centers->points[top_pt].x <
+  if (spherical_centers->points[top_pt].x >
     spherical_centers->points[top_pt2].x) {
-    int aux = lefttop_pt;
-    lefttop_pt = righttop_pt;
-    righttop_pt = aux;
-  }
-
-  // Swap indices if target is located in the pi,-pi discontinuity
-  double angle_diff = spherical_centers->points[lefttop_pt].x -
-  spherical_centers->points[righttop_pt].x;
-  if (angle_diff > M_PI - spherical_centers->points[lefttop_pt].x) {
     int aux = lefttop_pt;
     lefttop_pt = righttop_pt;
     righttop_pt = aux;
@@ -409,9 +433,9 @@ void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc, pcl::PointCloud<
   {
     for (auto& point : v->points)
     {
-      float x_new = point.z;  
-      float y_new = -point.x; 
-      float z_new = -point.y;  
+      float x_new =  point.y;
+      float y_new = -point.x;
+      float z_new =  point.z;
 
       point.x = x_new;
       point.y = y_new;
@@ -453,7 +477,8 @@ public:
             for (size_t j = i + 1; j < _candidates.size(); ++j) {
                 float dx = _candidates[i].x - _candidates[j].x;
                 float dy = _candidates[i].y - _candidates[j].y;
-                float distance = sqrt(dx*dx + dy*dy);
+                float dz = _candidates[i].z - _candidates[j].z;
+                float distance = sqrt(dx*dx + dy*dy + dz*dz);
                 
                 // Check if this distance matches expected width or height
                 if (abs(distance - _delta_width) < GEOMETRY_TOLERANCE) {

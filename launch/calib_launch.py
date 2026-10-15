@@ -22,7 +22,7 @@ def generate_launch_description():
     params_file = os.path.join(pkg_share, 'config', 'qr_params.yaml')
     
     # RViz config file path
-    rviz_config = os.path.join(pkg_share, 'rviz_cfg', 'fast_livo2.rviz')
+    rviz_config = os.path.join(pkg_share, 'rviz_cfg', 'calibration.rviz')
 
     # Fast calib node
     fast_calib_node = Node(

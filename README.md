@@ -34,6 +34,44 @@ PCL>=1.8, OpenCV>=4.0.
 ros2 launch fast_calib calib_launch.py
 ```
 
+RViz opens with calibration topics and connected sensor frames. `Camera view`
+uses the photograph and CameraInfo to render the LiDAR scene from the camera's
+viewpoint. `Projection overlay` shows depth-colored LiDAR points over the
+rectified photograph; compare hole outlines, board edges, and scene boundaries.
+Toggle `Full LiDAR scene` to compare the camera view with and without points.
+Camera and LiDAR hole centers are green and red. The overlay is also saved as
+`projection_overlay.png` beside the calibration results. These previews appear
+before the full colored scene finishes processing. To run without RViz:
+
+```bash
+ros2 launch fast_calib calib_launch.py rviz:=false
+```
+
+The overlay marks the camera-derived hole centers with green crosses and the
+transformed LiDAR centers with red crosses; yellow arrows show their difference.
+`center_residuals.csv` records each correspondence's errors in meters and
+rectified-image pixels. ArUco corner reprojection RMSE is logged separately, so
+the 3D center-fit RMSE is not mistaken for pixel alignment accuracy. Supply the
+complete camera distortion model: `k1`, `k2`, `p1`, `p2`, and `k3` (default 0).
+
+The LiDAR mounting uses +Z forward, +X down, +Y left. Center sorting temporarily
+maps this to camera optical axes as `(-Y, X, Z)`, then restores `(Y, -X, Z)`.
+SVD receives the original sensor coordinates and sorting leaves its input cloud
+unchanged. Configure the point-cloud driver without an additional rotation.
+
+Calibration also publishes `calib_lidar_standard` (+X forward, +Y left, +Z up)
+as a child of `calib_lidar`, with the same origin. Select this frame as RViz's
+Fixed Frame to view the scene in standard LiDAR coordinates. The TF tree is
+`calib_camera_optical -> calib_lidar -> calib_lidar_standard`; this last edge
+uses pitch -90 degrees because its parent is the raw frame.
+
+`calib_result.txt` maps raw LiDAR coordinates to the camera. The additional
+`calib_result_standard.txt` maps standard LiDAR coordinates to the camera,
+using `T_camera_standard = T_camera_raw * T_raw_standard`. Use that file only
+when the consumer transforms the cloud into standard coordinates, not when
+it merely changes the cloud's frame name. Both extrinsics have the same
+translation because the two LiDAR frames share an origin.
+
 ## 3. Run on your own sensor suite
 
 1. Customize the calibration target in the image below.
@@ -42,6 +80,21 @@ ros2 launch fast_calib calib_launch.py
 4. Provide the instrinsic matrix in `qr_params.yaml`.
 5. Set distance filter in `qr_params.yaml` for board point cloud (extra points are acceptable).
 6. Calibrate now!
+
+LiDAR hole detection checks the full board cloud for empty interiors and requires
+four distinct centers matching `delta_width_circles` and `delta_height_circles`
+(0.5 × 0.4 m in the supplied configuration). All four sides and both diagonals
+must match within 3 cm. The interior check uses 80% of `circle_radius` and permits
+at most two isolated returns to tolerate noise. Rejected circle fits are removed
+and the search continues; calibration exits with an error before estimating or
+saving extrinsics if no valid four-hole target is found.
+
+For accumulated scans, `min_points_per_voxel` removes weakly supported returns
+before plane extraction (default 1; the supplied 73-scan bag uses 50).
+`plane_distance_threshold` controls the board plane's inlier distance in meters
+(default 0.01; the supplied configuration uses 0.02). Reduce voxel support for
+shorter recordings. Boundary detection uses the aligned plane normal and a
+neighborhood spanning adjacent scan rings.
 
 <p align="center">
   <img src="./pics/calibration_target.jpg" width="100%">

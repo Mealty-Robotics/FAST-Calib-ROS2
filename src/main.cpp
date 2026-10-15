@@ -8,7 +8,10 @@ which is included as part of this source code package.
 #include "qr_detect.hpp"
 #include "lidar_detect.hpp"
 #include "data_preprocess.hpp"
+#include "calibration_view.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/static_transform_broadcaster.hpp>
+#include <functional>
 
 int main(int argc, char **argv) 
 {
@@ -40,7 +43,13 @@ int main(int argc, char **argv)
     // Detect LiDAR data
     pcl::PointCloud<pcl::PointXYZ>::Ptr lidar_center_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     lidar_center_cloud->reserve(4);
-    lidarDetectPtr->detect_lidar(cloud_input, lidar_center_cloud);
+    if (!lidarDetectPtr->detect_lidar(cloud_input, lidar_center_cloud) ||
+        qr_center_cloud->size() != TARGET_NUM_CIRCLES) {
+        RCLCPP_ERROR(node->get_logger(),
+            "Calibration aborted: four valid LiDAR holes and four camera centers are required.");
+        rclcpp::shutdown();
+        return 1;
+    }
 
     // Sort detected circle centers from QR and LiDAR
     pcl::PointCloud<pcl::PointXYZ>::Ptr qr_centers(new pcl::PointCloud<pcl::PointXYZ>);
@@ -65,79 +74,150 @@ int main(int argc, char **argv)
       << rmse << " m" << RESET << std::endl;
     }
 
+    // A small aggregate 3D RMSE can still mean a visible image displacement.
+    // Report every correspondence in the same rectified pixels RViz displays.
+    std::filesystem::create_directories(params.output_path);
+    std::ofstream center_report(std::filesystem::path(params.output_path) / "center_residuals.csv");
+    center_report << "hole,lidar_x,lidar_y,lidar_z,camera_x,camera_y,camera_z,"
+        "error_x_m,error_y_m,error_z_m,error_m,error_u_px,error_v_px,error_px\n";
+    center_report << std::setprecision(10);
+    const auto rectified_pixel = [&](const pcl::PointXYZ& p) {
+        return cv::Point2d(params.fx * p.x / p.z + params.cx,
+                           params.fy * p.y / p.z + params.cy);
+    };
+    for (std::size_t i = 0; i < qr_centers->size(); ++i) {
+        const auto& raw = (*lidar_centers)[i];
+        const auto& expected = (*qr_centers)[i];
+        const auto& measured = (*aligned_lidar_centers)[i];
+        const Eigen::Vector3f delta = measured.getVector3fMap() - expected.getVector3fMap();
+        const cv::Point2d pixel_delta = rectified_pixel(measured) - rectified_pixel(expected);
+        const double pixel_error = cv::norm(pixel_delta);
+        RCLCPP_INFO(node->get_logger(), "Hole %zu residual: %.2f mm, %.2f px (du=%.2f, dv=%.2f).",
+            i + 1, delta.norm() * 1000.0, pixel_error, pixel_delta.x, pixel_delta.y);
+        center_report << i + 1 << ',' << raw.x << ',' << raw.y << ',' << raw.z << ','
+            << expected.x << ',' << expected.y << ',' << expected.z << ','
+            << delta.x() << ',' << delta.y() << ',' << delta.z() << ',' << delta.norm() << ','
+            << pixel_delta.x << ',' << pixel_delta.y << ',' << pixel_error << '\n';
+    }
+    center_report.close();
+
     std::cout << BOLDYELLOW << "[Result] Extrinsic parameters T_cam_lidar: " << RESET << std::endl;
     std::cout << BOLDCYAN << std::fixed << std::setprecision(6) << transformation << RESET << std::endl;
 
+    const Eigen::Matrix4f raw_from_standard = standardToRawLidar();
+    const Eigen::Matrix4f camera_from_standard = transformation * raw_from_standard;
+    std::cout << BOLDYELLOW << "[Result] Extrinsic parameters T_cam_lidar_standard: " << RESET << std::endl;
+    std::cout << BOLDCYAN << camera_from_standard << RESET << std::endl;
+
+    // Display each cloud in its actual frame. T_cam_lidar maps original
+    // LiDAR coordinates into camera optical coordinates; no mounting rotation
+    // is applied to the SVD inputs or to the recorded point cloud.
+    auto tf_broadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node);
+    const auto make_tf = [&](const Eigen::Matrix4d& matrix, const std::string& parent,
+                             const std::string& child) {
+        geometry_msgs::msg::TransformStamped tf;
+        tf.header.stamp = node->now();
+        tf.header.frame_id = parent;
+        tf.child_frame_id = child;
+        tf.transform.translation.x = matrix(0, 3);
+        tf.transform.translation.y = matrix(1, 3);
+        tf.transform.translation.z = matrix(2, 3);
+        const Eigen::Quaterniond q(matrix.block<3, 3>(0, 0));
+        tf.transform.rotation.x = q.x();
+        tf.transform.rotation.y = q.y();
+        tf.transform.rotation.z = q.z();
+        tf.transform.rotation.w = q.w();
+        return tf;
+    };
+    tf_broadcaster->sendTransform(std::vector<geometry_msgs::msg::TransformStamped>{
+        make_tf(transformation.cast<double>(), "calib_camera_optical", "calib_lidar"),
+        make_tf(lidarDetectPtr->getBoardTransform(), "calib_lidar", "calib_board"),
+        make_tf(raw_from_standard.cast<double>(), "calib_lidar", "calib_lidar_standard")});
+
+    // Latched snapshots let RViz connect before or after computation. Publish
+    // the board and centers before the expensive full-cloud projection/export.
+    const auto snapshot_qos = rclcpp::QoS(1).reliable().transient_local();
+    auto colored_cloud_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "colored_cloud", snapshot_qos);
+    auto aligned_lidar_centers_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "aligned_lidar_centers", snapshot_qos);
+    const auto publish_cloud = [&](const auto& cloud, const auto& publisher,
+                                   const std::string& frame) {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*cloud, msg);
+        msg.header.stamp = node->now();
+        msg.header.frame_id = frame;
+        publisher->publish(msg);
+    };
+    if (DEBUG) {
+        publish_cloud(qr_centers, qrDetectPtr->qr_pub_, "calib_camera_optical");
+        publish_cloud(lidar_centers, lidarDetectPtr->center_pub_, "calib_lidar");
+        publish_cloud(lidarDetectPtr->getFilteredCloud(), lidarDetectPtr->filtered_pub_, "calib_lidar");
+        publish_cloud(lidarDetectPtr->getPlaneCloud(), lidarDetectPtr->plane_pub_, "calib_lidar");
+        publish_cloud(lidarDetectPtr->getAlignedCloud(), lidarDetectPtr->aligned_pub_, "calib_board");
+        publish_cloud(lidarDetectPtr->getEdgeCloud(), lidarDetectPtr->edge_pub_, "calib_board");
+        publish_cloud(lidarDetectPtr->getCenterZ0Cloud(), lidarDetectPtr->center_z0_pub_, "calib_board");
+        publish_cloud(aligned_lidar_centers, aligned_lidar_centers_pub, "calib_camera_optical");
+    }
+    RCLCPP_INFO(node->get_logger(), "Board and center snapshots ready for RViz.");
+
+    // Full-scene verification, independent of the target ROI and image colors.
+    pcl::PointCloud<pcl::PointXYZ>::Ptr scene(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::VoxelGrid<pcl::PointXYZ> scene_filter;
+    scene_filter.setInputCloud(cloud_input);
+    scene_filter.setLeafSize(0.01f, 0.01f, 0.01f);
+    scene_filter.filter(*scene);
+    auto scene_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "calibration_scene", snapshot_qos);
+    publish_cloud(scene, scene_pub, "calib_lidar");
+    auto view = makeCalibrationView(img_input, qrDetectPtr->cameraMatrix_,
+        qrDetectPtr->distCoeffs_, *scene, transformation);
+    for (std::size_t i = 0; i < qr_centers->size(); ++i) {
+        const cv::Point expected = rectified_pixel((*qr_centers)[i]);
+        const cv::Point measured = rectified_pixel((*aligned_lidar_centers)[i]);
+        cv::arrowedLine(view.overlay, measured, expected, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+        cv::drawMarker(view.overlay, expected, cv::Scalar(0, 255, 0), cv::MARKER_CROSS, 14, 2);
+        cv::drawMarker(view.overlay, measured, cv::Scalar(0, 0, 255), cv::MARKER_TILTED_CROSS, 14, 2);
+    }
+    auto image_pub = node->create_publisher<sensor_msgs::msg::Image>(
+        "calibration_camera/image_rect", snapshot_qos);
+    auto info_pub = node->create_publisher<sensor_msgs::msg::CameraInfo>(
+        "calibration_camera/camera_info", snapshot_qos);
+    auto overlay_pub = node->create_publisher<sensor_msgs::msg::Image>(
+        "calibration_camera/overlay", snapshot_qos);
+    std::function<void()> publish_camera = [image_pub, info_pub, overlay_pub, clock = node->get_clock(),
+        image = *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", view.rectified).toImageMsg(),
+        overlay = *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", view.overlay).toImageMsg(),
+        info = view.info]() mutable {
+        info.header.stamp = clock->now();
+        info.header.frame_id = "calib_camera_optical";
+        image.header = info.header;
+        overlay.header = info.header;
+        info_pub->publish(info);
+        image_pub->publish(image);
+        overlay_pub->publish(overlay);
+    };
+    publish_camera();
+    // CameraInfo subscribers may be volatile; repeat snapshots for late viewers.
+    auto camera_timer = node->create_wall_timer(std::chrono::seconds(1), publish_camera);
+    RCLCPP_INFO(node->get_logger(), "Camera verification ready: %zu projected pixels.", view.projected_pixels);
+    std::filesystem::create_directories(params.output_path);
+    cv::imwrite((std::filesystem::path(params.output_path) / "projection_overlay.png").string(), view.overlay);
+
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
     projectPointCloudToImage(cloud_input, transformation, qrDetectPtr->cameraMatrix_, qrDetectPtr->distCoeffs_, img_input, colored_cloud);
+    // Keep the RViz preview small even when the bag contains millions of points.
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr preview(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::VoxelGrid<pcl::PointXYZRGB> preview_filter;
+    preview_filter.setInputCloud(colored_cloud);
+    preview_filter.setLeafSize(0.01f, 0.01f, 0.01f);
+    preview_filter.filter(*preview);
+    if (DEBUG)
+        publish_cloud(preview, colored_cloud_pub, "calib_camera_optical");
+    saveCalibrationResults(params, transformation, colored_cloud, qrDetectPtr->imageCopy_, camera_from_standard);
 
-    saveCalibrationResults(params, transformation, colored_cloud, qrDetectPtr->imageCopy_);
-
-    auto colored_cloud_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("colored_cloud", 1);
-    auto aligned_lidar_centers_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_lidar_centers", 1);
-
-    // Main loop
-    rclcpp::Rate rate(1);
-    while (rclcpp::ok()) 
-    {
-      if (DEBUG) 
-      {
-        // Publish QR detection results
-        sensor_msgs::msg::PointCloud2 qr_centers_msg;
-        pcl::toROSMsg(*qr_centers, qr_centers_msg);
-        qr_centers_msg.header.stamp = node->get_clock()->now();
-        qr_centers_msg.header.frame_id = "map";
-        qrDetectPtr->qr_pub_->publish(qr_centers_msg);
-
-        // Publish LiDAR detection results
-        sensor_msgs::msg::PointCloud2 lidar_centers_msg;
-        pcl::toROSMsg(*lidar_centers, lidar_centers_msg);
-        lidar_centers_msg.header = qr_centers_msg.header;
-        lidarDetectPtr->center_pub_->publish(lidar_centers_msg);
-
-        // Publish intermediate results
-        sensor_msgs::msg::PointCloud2 filtered_cloud_msg;
-        pcl::toROSMsg(*lidarDetectPtr->getFilteredCloud(), filtered_cloud_msg);
-        filtered_cloud_msg.header = qr_centers_msg.header;
-        lidarDetectPtr->filtered_pub_->publish(filtered_cloud_msg);
-
-        sensor_msgs::msg::PointCloud2 plane_cloud_msg;
-        pcl::toROSMsg(*lidarDetectPtr->getPlaneCloud(), plane_cloud_msg);
-        plane_cloud_msg.header = qr_centers_msg.header;
-        lidarDetectPtr->plane_pub_->publish(plane_cloud_msg);
-
-        sensor_msgs::msg::PointCloud2 aligned_cloud_msg;
-        pcl::toROSMsg(*lidarDetectPtr->getAlignedCloud(), aligned_cloud_msg);
-        aligned_cloud_msg.header = qr_centers_msg.header;
-        lidarDetectPtr->aligned_pub_->publish(aligned_cloud_msg);
-
-        sensor_msgs::msg::PointCloud2 edge_cloud_msg;
-        pcl::toROSMsg(*lidarDetectPtr->getEdgeCloud(), edge_cloud_msg);
-        edge_cloud_msg.header = qr_centers_msg.header;
-        lidarDetectPtr->edge_pub_->publish(edge_cloud_msg);
-
-        sensor_msgs::msg::PointCloud2 lidar_centers_z0_msg;
-        pcl::toROSMsg(*lidarDetectPtr->getCenterZ0Cloud(), lidar_centers_z0_msg);
-        lidar_centers_z0_msg.header = qr_centers_msg.header;
-        lidarDetectPtr->center_z0_pub_->publish(lidar_centers_z0_msg);
-
-        // Publish transformed LiDAR point cloud
-        sensor_msgs::msg::PointCloud2 aligned_lidar_centers_msg;
-        pcl::toROSMsg(*aligned_lidar_centers, aligned_lidar_centers_msg);
-        aligned_lidar_centers_msg.header = qr_centers_msg.header;
-        aligned_lidar_centers_pub->publish(aligned_lidar_centers_msg);
-
-        // Publish colored point cloud
-        sensor_msgs::msg::PointCloud2 colored_cloud_msg;
-        pcl::toROSMsg(*colored_cloud, colored_cloud_msg);
-        colored_cloud_msg.header = qr_centers_msg.header;
-        colored_cloud_pub->publish(colored_cloud_msg);
-      }
-      
-      rclcpp::spin_some(node);
-      rate.sleep();
-    }
-
+    if (rclcpp::ok())
+        rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }

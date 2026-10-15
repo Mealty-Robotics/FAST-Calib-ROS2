@@ -2,37 +2,42 @@
 fast_calib:
   ros__parameters:
     # mid360
-    fx: 522.123514287681
-    fy: 522.275153384482
-    cx: 773.466430504725
-    cy: 534.053165700174
-    k1: 0.00324949759262203
-    k2: -0.0171040538369167
-    p1: 0.000669657443377146
-    p2: -0.000350205468789575
+    fx: 1497.957147
+    fy: 1493.485423
+    cx: 971.676063
+    cy: 539.433737
+    k1: 0.054994
+    k2: -0.054911
+    p1: -0.001031
+    p2: -0.000022
+    k3: 0.000000
 
     # Calibration target parameters
-    marker_size: 0.16 # ArUco marker size (our test data uses 0.16m; adjust to match your marker size)
-    delta_width_qr_center: 0.47 # Half the distance between the centers of two markers in the horizontal direction
-    delta_height_qr_center: 0.27 # Half the distance between the centers of two markers in the vertical direction
-    delta_width_circles: 0.4 # Distance between the centers of two circles in the horizontal direction
-    delta_height_circles: 0.3 # Distance between the centers of two circles in the vertical direction
-    circle_radius: 0.10 # Radius of the circle
+    marker_size: 0.20 # ArUco marker size (our test data uses 0.16m; adjust to match your marker size)
+    delta_width_qr_center: 0.55 # Half the distance between the centers of two markers in the horizontal direction
+    delta_height_qr_center: 0.35 # Half the distance between the centers of two markers in the vertical direction
+    delta_width_circles: 0.5 # Distance between the centers of two circles in the horizontal direction
+    delta_height_circles: 0.4 # Distance between the centers of two circles in the vertical direction
+    circle_radius: 0.12 # Radius of the circle
+    # This bag accumulates 73 scans. Reject weakly supported noise voxels.
+    min_points_per_voxel: 50
+    plane_distance_threshold: 0.02 # Include board returns within 2 cm of its plane.
 
-    # Distance filter
-    x_min: 1.5
-    x_max: 3.0
-    y_min: -1.5
-    y_max: 2.0
-    z_min: -0.5 # avia and mid360: -0.5 ouster: -0.8
-    z_max: 2.0
+    # Board bounds in the recorded /rslidar_points coordinates (depth is Z).
+    x_min: -0.58801
+    x_max: 0.50846
+    y_min: -0.69436
+    y_max: 0.82626
+    z_min: 1.97507
+    z_max: 2.07879
 
-    lidar_topic: "/livox/points" # /ouster/points /livox/lidar
-    bag_path: "/home/maro/Pictures/rosbag2_2025_07_11-21_17_03"
-    image_path: "/home/maro/Pictures/00.png"
+    lidar_topic: /rslidar_points #"/livox/lidar" # /ouster/points /livox/points
+    # Open this single database directly; its Jazzy metadata.yaml is incompatible with Humble.
+    bag_path: "/home/marv/code/calib_lidar/output_db3_dir/output_db3_dir_0.db3"
+    image_path: "/home/marv/code/calib_lidar/1.png"
 
     # Output
-    output_path: "/home/parallels/bag_image/bag_images"
+    output_path: "/home/marv/code/calib_lidar/result"
 
     # Add minimum detected markers parameter
     min_detected_markers: 3
