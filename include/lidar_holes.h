@@ -20,24 +20,50 @@ struct SearchStats {
     std::size_t rejected_radius = 0;
     std::size_t rejected_interior = 0;
     std::size_t rejected_duplicate = 0;
+    std::size_t rejected_coverage = 0;
 };
+
+struct CircleCandidate {
+    pcl::PointXYZ center;
+    double error;
+    std::size_t support;
+};
+
+inline std::size_t angularSector(double x, double y)
+{
+    const double pi = std::acos(-1.0);
+    return std::min<std::size_t>(7, (std::atan2(y, x) + pi) * 8.0 / (2.0 * pi));
+}
 
 inline double distance(const pcl::PointXYZ& a, const pcl::PointXYZ& b)
 {
     return std::hypot(a.x - b.x, a.y - b.y);
 }
 
-// Use the entire board, not just boundary points: scan rings can fit circles
-// even though there are board returns well inside them. Ignore the outer 20%
-// of the radius for edge noise, and allow at most two isolated interior returns.
+// Compare spatial return densities, using the full board rather than edges.
+// A fixed point-count cutoff rejects real holes as more scans accumulate.
+// The inner disk must have at most 5% of the surrounding board's density;
+// require board returns around the hole as well, to reject exterior arcs.
 inline bool emptyInterior(const Cloud& board, const pcl::PointXYZ& center, double radius)
 {
-    std::size_t interior = 0;
+    std::size_t interior = 0, surrounding = 0;
+    std::array<std::size_t, 8> sectors{};
     for (const auto& point : board) {
-        if (distance(point, center) < 0.8 * radius && ++interior > 2)
-            return false;
+        const double d = distance(point, center);
+        if (d < 0.8 * radius)
+            ++interior;
+        if (d > 1.1 * radius && d < 1.6 * radius) {
+            ++surrounding;
+            ++sectors[angularSector(point.x - center.x, point.y - center.y)];
+        }
     }
-    return true;
+    const auto covered = std::count_if(sectors.begin(), sectors.end(),
+        [](std::size_t n) { return n >= 2; });
+    if (surrounding < min_circle_inliers || covered < 6)
+        return false;
+    // Areas divided by pi * radius^2: inner disk 0.64, annulus 1.35.
+    const double density_ratio = interior * 1.35 / (surrounding * 0.64);
+    return interior <= 2 || density_ratio <= 0.05;
 }
 
 inline bool distinctCenter(const Cloud& centers, const pcl::PointXYZ& center, double radius)
@@ -49,8 +75,28 @@ inline bool distinctCenter(const Cloud& centers, const pcl::PointXYZ& center, do
     return true;
 }
 
+inline bool hasCircularSupport(const Cloud& board, const pcl::PointXYZ& center, double radius)
+{
+    // Opposite arcs of one hole may belong to separate edge clusters. Check
+    // the entire board's narrow rim, not only the current RANSAC inliers.
+    std::vector<double> angles;
+    for (const auto& point : board) {
+        if (std::abs(distance(point, center) - radius) < fit_tolerance)
+            angles.push_back(std::atan2(point.y - center.y, point.x - center.x));
+    }
+    if (angles.size() < min_circle_inliers)
+        return false;
+    std::sort(angles.begin(), angles.end());
+    const double pi = std::acos(-1.0);
+    double max_gap = angles.front() + 2.0 * pi - angles.back();
+    for (std::size_t i = 1; i < angles.size(); ++i)
+        max_gap = std::max(max_gap, angles[i] - angles[i - 1]);
+    return max_gap < pi;
+}
+
 inline void extractCandidates(Cloud::Ptr remaining, const Cloud& board,
-                              double radius, Cloud& centers, SearchStats* stats = nullptr)
+                              double radius, std::vector<CircleCandidate>& candidates,
+                              SearchStats* stats = nullptr)
 {
     if (!std::isfinite(radius) || radius <= 0.0)
         return;
@@ -80,17 +126,18 @@ inline void extractCandidates(Cloud::Ptr remaining, const Cloud& board,
             std::abs(coefficients.values[2] - radius) < fit_tolerance) {
             const pcl::PointXYZ center(coefficients.values[0], coefficients.values[1], 0.0f);
             double error = 0.0;
-            for (const auto index : inliers->indices)
+            for (const auto index : inliers->indices) {
                 error += std::abs(distance((*remaining)[index], center) - radius);
+            }
             error /= inliers->indices.size();
             if (error >= fit_tolerance) {
                 if (stats) ++stats->rejected_radius;
+            } else if (!hasCircularSupport(board, center, radius)) {
+                if (stats) ++stats->rejected_coverage;
             } else if (!emptyInterior(board, center, radius)) {
                 if (stats) ++stats->rejected_interior;
-            } else if (!distinctCenter(centers, center, radius)) {
-                if (stats) ++stats->rejected_duplicate;
             } else {
-                centers.push_back(center);
+                candidates.push_back({center, error, inliers->indices.size()});
             }
         } else if (stats) {
             ++stats->rejected_radius;
@@ -104,6 +151,26 @@ inline void extractCandidates(Cloud::Ptr remaining, const Cloud& board,
         extract.filter(*next);
         remaining = next;
     }
+}
+
+// Keep the best fit for each hole after searching every cluster. An early,
+// biased partial fit must not suppress a later, more accurate fit nearby.
+inline Cloud distinctCandidates(std::vector<CircleCandidate> candidates, double radius,
+                                SearchStats* stats = nullptr)
+{
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const CircleCandidate& a, const CircleCandidate& b) {
+            if (a.error != b.error) return a.error < b.error;
+            return a.support > b.support;
+        });
+    Cloud centers;
+    for (const auto& candidate : candidates) {
+        if (distinctCenter(centers, candidate.center, radius))
+            centers.push_back(candidate.center);
+        else if (stats)
+            ++stats->rejected_duplicate;
+    }
+    return centers;
 }
 
 // Test all assignments of the four corners. Checking all six distances with

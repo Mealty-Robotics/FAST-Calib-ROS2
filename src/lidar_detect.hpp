@@ -215,19 +215,20 @@ public:
     
         // Fit and validate all candidates before choosing a target. The full
         // aligned board is needed to distinguish holes from concentric scans.
-        pcl::PointCloud<pcl::PointXYZ> candidates;
+        std::vector<lidar_holes::CircleCandidate> circle_candidates;
         lidar_holes::SearchStats search_stats;
         for (const auto& indices : cluster_indices) {
             pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
             for (const auto index : indices.indices)
                 cluster->push_back(edge_cloud_->points[index]);
-            lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, candidates, &search_stats);
+            lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, circle_candidates, &search_stats);
         }
+        const auto candidates = lidar_holes::distinctCandidates(circle_candidates, circle_radius_, &search_stats);
         RCLCPP_INFO(node_->get_logger(),
             "Circle search: %zu fits, %zu rejected for radius/error, %zu for occupied interiors, "
-            "%zu duplicates, %zu candidates (radius %.3f m).",
+            "%zu for partial arcs, %zu duplicates, %zu candidates (radius %.3f m).",
             search_stats.fits, search_stats.rejected_radius, search_stats.rejected_interior,
-            search_stats.rejected_duplicate, candidates.size(), circle_radius_);
+            search_stats.rejected_coverage, search_stats.rejected_duplicate, candidates.size(), circle_radius_);
 
         if (!lidar_holes::selectTarget(candidates, target_width_, target_height_,
                                       circle_radius_, *center_z0_cloud_)) {

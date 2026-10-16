@@ -84,17 +84,28 @@ translation because the two LiDAR frames share an origin.
 LiDAR hole detection checks the full board cloud for empty interiors and requires
 four distinct centers matching `delta_width_circles` and `delta_height_circles`
 (0.5 × 0.4 m in the supplied configuration). All four sides and both diagonals
-must match within 3 cm. The interior check uses 80% of `circle_radius` and permits
-at most two isolated returns to tolerate noise. Rejected circle fits are removed
+must match within 3 cm. The interior check uses 80% of `circle_radius` and
+compares return density with the surrounding board (an annulus at 1.1–1.6 radii).
+It tolerates two isolated returns or an interior density below 5% of the board
+density, so sparse noise in longer recordings does not hide actual holes.
+Surrounding board support must cover at least six of eight angular sectors.
+Rim support across the full board must span more than a semicircle, rejecting
+short exterior arcs while allowing separate edge clusters around one hole. Nearby fits are
+ranked by error against the known radius before selecting distinct centers.
+Rejected circle fits are removed
 and the search continues; calibration exits with an error before estimating or
 saving extrinsics if no valid four-hole target is found.
 
 For accumulated scans, `min_points_per_voxel` removes weakly supported returns
-before plane extraction (default 1; the supplied 73-scan bag uses 50).
+before plane extraction (default 1; the current 128-scan bag uses 50).
 `plane_distance_threshold` controls the board plane's inlier distance in meters
 (default 0.01; the supplied configuration uses 0.02). Reduce voxel support for
 shorter recordings. Boundary detection uses the aligned plane normal and a
 neighborhood spanning adjacent scan rings.
+
+The supplied crop, bag path, and image path are for the left-side recording and
+`2.png`. Adjust the XYZ bounds when the board moves; the whole four-hole pattern
+must remain inside the crop.
 
 <p align="center">
   <img src="./pics/calibration_target.jpg" width="100%">
