@@ -115,7 +115,8 @@ The interior disk uses 80% of `circle_radius`, compared with surrounding board
 returns at 1.1–1.6 radii. The defaults allow two isolated interior returns or 5%
 of board density, require six surrounding sectors and more than a semicircle
 of rim support. Rim support uses the whole board, allowing split edge clusters.
-Nearby fits are ranked by radius error before deduplication. Rejected fitted
+Nearby fits remain alternative hypotheses until target geometry is checked.
+Only the RViz candidate summary is deduplicated by radius error. Rejected fitted
 inliers are removed and circle search continues.
 
 If calibration fails, no new extrinsics are saved. The node keeps running until

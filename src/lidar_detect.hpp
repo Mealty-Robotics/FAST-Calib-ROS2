@@ -239,20 +239,65 @@ public:
                 cluster->push_back(edge_cloud_->points[index]);
             lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, circle_candidates, &search_stats, options_);
         }
+        // Keep every validated fit for geometry selection. Nearby fits are
+        // alternative center hypotheses, not interchangeable measurements:
+        // radius error alone cannot decide which belongs to the rectangle.
+        lidar_holes::Cloud hypotheses;
+        for (const auto& candidate : circle_candidates)
+            hypotheses.push_back(candidate.center);
+        // Deduplicate only the RViz summary; selectTarget enforces distinct
+        // holes by their separation while evaluating the full hypothesis set.
         const auto candidates = lidar_holes::distinctCandidates(circle_candidates, circle_radius_, &search_stats);
         *candidates_ = candidates;
         *rejected_ = search_stats.rejected_centers;
         RCLCPP_INFO(node_->get_logger(),
-            "Circle search: %zu fits, %zu rejected for radius/error, %zu for occupied interiors, "
-            "%zu for partial arcs, %zu duplicates, %zu candidates (radius %.3f m).",
+            "Circle search: %zu fits, %zu rejected for radius/error, %zu for interior/surround support, "
+            "%zu for partial arcs, %zu nearby alternatives, %zu distinct candidates (radius %.3f m).",
             search_stats.fits, search_stats.rejected_radius, search_stats.rejected_interior,
             search_stats.rejected_coverage, search_stats.rejected_duplicate, candidates.size(), circle_radius_);
 
-        if (!lidar_holes::selectTarget(candidates, target_width_, target_height_,
+        if (!lidar_holes::selectTarget(hypotheses, target_width_, target_height_,
                                       circle_radius_, *center_z0_cloud_, options_)) {
             RCLCPP_ERROR(node_->get_logger(),
-                "No valid set of at least %d LiDAR holes (target %.3f x %.3f m, %zu candidates).",
-                options_.min_holes, target_width_, target_height_, candidates.size());
+                "No valid set of at least %d LiDAR holes (target %.3f x %.3f m, "
+                "%zu distinct candidates, %zu hypotheses, distance tolerance %.4f m).",
+                options_.min_holes, target_width_, target_height_, candidates.size(),
+                hypotheses.size(), options_.geometry_tolerance);
+            for (std::size_t i = 0; i < circle_candidates.size(); ++i) {
+                const auto& candidate = circle_candidates[i];
+                RCLCPP_INFO(node_->get_logger(),
+                    "Hole hypothesis %zu: board XY=(%.4f, %.4f) m, radius error=%.4f m, support=%zu.",
+                    i + 1, candidate.center.x, candidate.center.y, candidate.error, candidate.support);
+            }
+            const std::array<double, 3> expected{{std::min(target_width_, target_height_),
+                std::max(target_width_, target_height_), std::hypot(target_width_, target_height_)}};
+            double best_error = std::numeric_limits<double>::infinity();
+            std::array<std::size_t, 3> best_indices{};
+            std::array<double, 3> best_lengths{};
+            for (std::size_t a = 0; a < hypotheses.size(); ++a)
+            for (std::size_t b = a + 1; b < hypotheses.size(); ++b)
+            for (std::size_t c = b + 1; c < hypotheses.size(); ++c) {
+                std::array<double, 3> lengths{{lidar_holes::distance(hypotheses[a], hypotheses[b]),
+                    lidar_holes::distance(hypotheses[a], hypotheses[c]),
+                    lidar_holes::distance(hypotheses[b], hypotheses[c])}};
+                std::sort(lengths.begin(), lengths.end());
+                if (lengths[0] < 2 * circle_radius_) continue;
+                double error = 0.0;
+                for (std::size_t i = 0; i < 3; ++i)
+                    error = std::max(error, std::abs(lengths[i] - expected[i]));
+                if (error < best_error) {
+                    best_error = error;
+                    best_indices = {{a, b, c}};
+                    best_lengths = lengths;
+                }
+            }
+            if (std::isfinite(best_error))
+                RCLCPP_WARN(node_->get_logger(),
+                    "Closest triangle hypotheses %zu/%zu/%zu: sorted distances %.4f/%.4f/%.4f m; "
+                    "expected %.4f/%.4f/%.4f m; largest distance error %.4f m (tolerance %.4f m).",
+                    best_indices[0] + 1, best_indices[1] + 1, best_indices[2] + 1,
+                    best_lengths[0], best_lengths[1], best_lengths[2], expected[0], expected[1], expected[2],
+                    best_error, options_.geometry_tolerance);
             return false;
         }
 

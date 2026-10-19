@@ -169,8 +169,8 @@ inline void extractCandidates(Cloud::Ptr remaining, const Cloud& board,
     }
 }
 
-// Keep the best fit for each hole after searching every cluster. An early,
-// biased partial fit must not suppress a later, more accurate fit nearby.
+// Summarize nearby fits for visualization only. Geometry selection must use
+// all validated hypotheses: radius error alone cannot identify the true center.
 inline Cloud distinctCandidates(std::vector<CircleCandidate> candidates, double radius,
                                 SearchStats* stats = nullptr)
 {
