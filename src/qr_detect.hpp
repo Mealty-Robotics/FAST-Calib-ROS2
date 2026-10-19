@@ -209,13 +209,26 @@ class QRDetect
 
       cv::Vec3d rvec(0, 0, 0), tvec(0, 0, 0);
 
-      if (ids.size() >= static_cast<size_t>(min_detected_markers_) && ids.size() <= TARGET_NUM_CIRCLES) 
-      {
-        // Estimate 3D position of the markers
-        std::vector<cv::Vec3d> rvecs, tvecs;
+      // Estimate each marker independently so reported distances are measured
+      // from the image, rather than imposed by the configured board geometry.
+      std::vector<cv::Vec3d> rvecs, tvecs;
+      if (!ids.empty()) {
         cv::aruco::estimatePoseSingleMarkers(corners, marker_size_, cameraMatrix_,
                                             distCoeffs_, rvecs, tvecs);
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+          for (std::size_t j = i + 1; j < ids.size(); ++j) {
+            const double distance = cv::norm(tvecs[i] - tvecs[j]);
+            if (!std::isfinite(distance) || tvecs[i][2] <= 0.0 || tvecs[j][2] <= 0.0)
+              continue;
+            RCLCPP_INFO(node_->get_logger(),
+                "ArUco centers ID %d <-> ID %d: %.4f m (independent marker poses, marker_size=%.3f m).",
+                ids[i], ids[j], distance, marker_size_);
+          }
+        }
+      }
 
+      if (ids.size() >= static_cast<size_t>(min_detected_markers_) && ids.size() <= TARGET_NUM_CIRCLES)
+      {
         // Draw markers' axis and centers in color image
         for (size_t i = 0; i < ids.size(); i++) {
           cv::drawFrameAxes(imageCopy_, cameraMatrix_, distCoeffs_, rvecs[i],
