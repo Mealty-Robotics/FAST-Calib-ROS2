@@ -23,6 +23,11 @@ private:
     double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
     double circle_radius_;
     double target_width_, target_height_;
+    lidar_holes::Options options_;
+    double boundary_search_radius_, cluster_tolerance_;
+    bool has_board_transform_ = false;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr candidates_{new pcl::PointCloud<pcl::PointXYZ>};
+    pcl::PointCloud<pcl::PointXYZ>::Ptr rejected_{new pcl::PointCloud<pcl::PointXYZ>};
     Eigen::Matrix4d board_transform_ = Eigen::Matrix4d::Identity();
     int min_points_per_voxel_;
     double plane_distance_threshold_;
@@ -58,6 +63,9 @@ public:
         z_min_ = params.z_min;
         z_max_ = params.z_max;
         circle_radius_ = params.circle_radius;
+        options_ = params.hole_options;
+        boundary_search_radius_ = params.boundary_search_radius;
+        cluster_tolerance_ = params.edge_cluster_tolerance;
         target_width_ = params.delta_width_circles;
         target_height_ = params.delta_height_circles;
         min_points_per_voxel_ = params.min_points_per_voxel;
@@ -74,6 +82,9 @@ public:
     bool detect_lidar(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::PointCloud<pcl::PointXYZ>::Ptr center_cloud)
     {
         center_cloud->clear();
+        candidates_->clear();
+        rejected_->clear();
+        has_board_transform_ = false;
         center_z0_cloud_->clear();
         plane_cloud_->clear();
         aligned_cloud_->clear();
@@ -161,7 +172,7 @@ public:
             normal, Eigen::Vector3d::UnitZ()).toRotationMatrix();
 
         // 应用旋转矩阵，将平面对齐到 Z=0 平面
-        float average_z = 0.0;
+        double average_z = 0.0;
         int cnt = 0;
         for (const auto& pt : *plane_cloud_) {
             Eigen::Vector3d point(pt.x, pt.y, pt.z);
@@ -171,6 +182,10 @@ public:
             cnt++;
         }
         average_z /= cnt;
+        board_transform_.setIdentity();
+        board_transform_.block<3, 3>(0, 0) = R.transpose();
+        board_transform_.block<3, 1>(0, 3) = R.transpose() * Eigen::Vector3d(0.0, 0.0, average_z);
+        has_board_transform_ = true;
 
         // 4. 提取边缘点
         edge_cloud_->clear();
@@ -179,7 +194,8 @@ public:
         // The cloud is already planar and aligned with Z. Estimating normals
         // on individual sparse scan rings is ill-conditioned; use the known
         // plane normal and span adjacent rings when looking for boundaries.
-        const double boundary_radius = std::max(0.03, circle_radius_ * 2.0 / 3.0);
+        const double boundary_radius = boundary_search_radius_ > 0 ? boundary_search_radius_ :
+            std::max(0.03, circle_radius_ * 2.0 / 3.0);
         pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
         normals->assign(aligned_cloud_->size(), pcl::Normal(0.0f, 0.0f, 1.0f));
     
@@ -204,8 +220,8 @@ public:
     
         std::vector<pcl::PointIndices> cluster_indices;
         pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-        ec.setClusterTolerance(boundary_radius / 2.0);
-        ec.setMinClusterSize(lidar_holes::min_circle_inliers);
+        ec.setClusterTolerance(cluster_tolerance_ > 0 ? cluster_tolerance_ : boundary_radius / 2.0);
+        ec.setMinClusterSize(options_.min_inliers);
         ec.setMaxClusterSize(std::numeric_limits<int>::max());
         ec.setSearchMethod(tree);
         ec.setInputCloud(edge_cloud_);
@@ -221,9 +237,11 @@ public:
             pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
             for (const auto index : indices.indices)
                 cluster->push_back(edge_cloud_->points[index]);
-            lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, circle_candidates, &search_stats);
+            lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, circle_candidates, &search_stats, options_);
         }
         const auto candidates = lidar_holes::distinctCandidates(circle_candidates, circle_radius_, &search_stats);
+        *candidates_ = candidates;
+        *rejected_ = search_stats.rejected_centers;
         RCLCPP_INFO(node_->get_logger(),
             "Circle search: %zu fits, %zu rejected for radius/error, %zu for occupied interiors, "
             "%zu for partial arcs, %zu duplicates, %zu candidates (radius %.3f m).",
@@ -231,10 +249,10 @@ public:
             search_stats.rejected_coverage, search_stats.rejected_duplicate, candidates.size(), circle_radius_);
 
         if (!lidar_holes::selectTarget(candidates, target_width_, target_height_,
-                                      circle_radius_, *center_z0_cloud_)) {
+                                      circle_radius_, *center_z0_cloud_, options_)) {
             RCLCPP_ERROR(node_->get_logger(),
-                "No valid set of four LiDAR holes (target %.3f x %.3f m, %zu candidates).",
-                target_width_, target_height_, candidates.size());
+                "No valid set of at least %d LiDAR holes (target %.3f x %.3f m, %zu candidates).",
+                options_.min_holes, target_width_, target_height_, candidates.size());
             return false;
         }
 
@@ -250,6 +268,9 @@ public:
         return true;
     }
 
+    bool hasBoardTransform() const { return has_board_transform_; }
+    pcl::PointCloud<pcl::PointXYZ>::Ptr getCandidates() const { return candidates_; }
+    pcl::PointCloud<pcl::PointXYZ>::Ptr getRejected() const { return rejected_; }
     Eigen::Matrix4d getBoardTransform() const { return board_transform_; }
 
     // 获取中间结果的点云

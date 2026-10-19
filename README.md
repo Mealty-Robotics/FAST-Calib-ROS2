@@ -81,31 +81,53 @@ translation because the two LiDAR frames share an origin.
 5. Set distance filter in `qr_params.yaml` for board point cloud (extra points are acceptable).
 6. Calibrate now!
 
-LiDAR hole detection checks the full board cloud for empty interiors and requires
-four distinct centers matching `delta_width_circles` and `delta_height_circles`
-(0.5 × 0.4 m in the supplied configuration). All four sides and both diagonals
-must match within 3 cm. The interior check uses 80% of `circle_radius` and
-compares return density with the surrounding board (an annulus at 1.1–1.6 radii).
-It tolerates two isolated returns or an interior density below 5% of the board
-density, so sparse noise in longer recordings does not hide actual holes.
-Surrounding board support must cover at least six of eight angular sectors.
-Rim support across the full board must span more than a semicircle, rejecting
-short exterior arcs while allowing separate edge clusters around one hole. Nearby fits are
-ranked by error against the known radius before selecting distinct centers.
-Rejected circle fits are removed
-and the search continues; calibration exits with an error before estimating or
-saving extrinsics if no valid four-hole target is found.
+LiDAR hole detection checks the full board cloud for empty interiors and distinct
+centers. Four matching corners are preferred; `min_lidar_holes: 3` also accepts
+three measured corners whose pair distances match the width, height and diagonal
+(0.5, 0.4 and approximately 0.6403 m). `min_lidar_holes: 4` restores strict
+four-corner operation. No missing center is synthesized: SVD uses only the three
+or four observed centers in their original sensor coordinates.
 
-For accumulated scans, `min_points_per_voxel` removes weakly supported returns
-before plane extraction (default 1; the current 128-scan bag uses 50).
-`plane_distance_threshold` controls the board plane's inlier distance in meters
-(default 0.01; the supplied configuration uses 0.02). Reduce voxel support for
-shorter recordings. Boundary detection uses the aligned plane normal and a
-neighborhood spanning adjacent scan rings.
+Camera corner assignments are checked against pair distances and the known
+mounting (+Z forward, +X down, +Y left in the raw LiDAR frame).
+`max_mounting_rotation_deg` limits rotation away from that mounting (default
+45 degrees, must be below 90) to resolve the rectangular target's symmetries.
+This prior must agree with your mounting; it does not rotate the SVD inputs.
 
-The supplied crop, bag path, and image path are for the left-side recording and
-`2.png`. Adjust the XYZ bounds when the board moves; the whole four-hole pattern
-must remain inside the crop.
+Tune the following parameters in `config/qr_params.yaml`; distances are meters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `circle_min_inliers` | Minimum points supporting each circle; separate from number of holes. |
+| `circle_fit_distance` | RANSAC point-to-circumference tolerance. |
+| `circle_radius_tolerance` | Radius/mean fit error tolerance and rim-support band. |
+| `hole_geometry_tolerance` | Allowed side/diagonal and correspondence distance error. |
+| `hole_max_interior_density` | Maximum inside/board density ratio; larger permits more interior returns. |
+| `hole_max_interior_points` | Isolated interior returns allowed regardless of density. |
+| `hole_min_surround_sectors` | Required surrounding board sectors out of eight. |
+| `hole_max_angular_gap_deg` | Maximum unsupported rim angle; larger permits shorter arcs. |
+| `boundary_search_radius` | Boundary neighborhood; zero selects automatic radius. |
+| `edge_cluster_tolerance` | Edge clustering distance; zero selects automatic distance. |
+| `min_points_per_voxel` | Accumulated return support; reduce for shorter/sparser recordings. |
+| `plane_distance_threshold` | Board plane inlier distance. |
+
+The interior disk uses 80% of `circle_radius`, compared with surrounding board
+returns at 1.1–1.6 radii. The defaults allow two isolated interior returns or 5%
+of board density, require six surrounding sectors and more than a semicircle
+of rim support. Rim support uses the whole board, allowing split edge clusters.
+Nearby fits are ranked by radius error before deduplication. Rejected fitted
+inliers are removed and circle search continues.
+
+If calibration fails, no new extrinsics are saved. The node keeps running until
+Ctrl+C so RViz can show the scene, cropped board, boundaries, accepted candidate
+centers (yellow), rejected circle centers (magenta), and rectified camera image.
+The fixed frame is `calib_lidar`. Camera/LiDAR TF and projection overlay require
+a valid calibration; a failed attempt labels the overlay image as image only.
+The optional RViz **Camera view** display can be enabled after calibration succeeds.
+
+Adjust the bag/image paths and XYZ crop for each recording. Keep the whole board
+inside the crop. Detection thresholds do not automatically adapt to a particular
+bag.
 
 <p align="center">
   <img src="./pics/calibration_target.jpg" width="100%">

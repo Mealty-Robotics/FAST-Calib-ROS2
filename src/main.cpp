@@ -9,6 +9,7 @@ which is included as part of this source code package.
 #include "lidar_detect.hpp"
 #include "data_preprocess.hpp"
 #include "calibration_view.hpp"
+#include "center_correspondence.h"
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 #include <functional>
@@ -38,76 +39,59 @@ int main(int argc, char **argv)
     // Detect QR codes
     pcl::PointCloud<pcl::PointXYZ>::Ptr qr_center_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     qr_center_cloud->reserve(4);
-    qrDetectPtr->detect_qr(img_input, qr_center_cloud);
+    if (!img_input.empty()) qrDetectPtr->detect_qr(img_input, qr_center_cloud);
 
     // Detect LiDAR data
     pcl::PointCloud<pcl::PointXYZ>::Ptr lidar_center_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     lidar_center_cloud->reserve(4);
-    if (!lidarDetectPtr->detect_lidar(cloud_input, lidar_center_cloud) ||
-        qr_center_cloud->size() != TARGET_NUM_CIRCLES) {
-        RCLCPP_ERROR(node->get_logger(),
-            "Calibration aborted: four valid LiDAR holes and four camera centers are required.");
-        rclcpp::shutdown();
-        return 1;
-    }
-
-    // Sort detected circle centers from QR and LiDAR
-    pcl::PointCloud<pcl::PointXYZ>::Ptr qr_centers(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr lidar_centers(new pcl::PointCloud<pcl::PointXYZ>);
-    sortPatternCenters(qr_center_cloud, qr_centers, "camera");
-    sortPatternCenters(lidar_center_cloud, lidar_centers, "lidar");
-
-    // Calculate extrinsic parameters
-    Eigen::Matrix4f transformation;
-    pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> svd;
-    svd.estimateRigidTransformation(*lidar_centers, *qr_centers, transformation);
-
-    // Transform LiDAR point cloud to QR coordinate system
-    pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_lidar_centers(new pcl::PointCloud<pcl::PointXYZ>);
-    aligned_lidar_centers->reserve(lidar_centers->size());
-    alignPointCloud(lidar_centers, aligned_lidar_centers, transformation);
-    
-    double rmse = computeRMSE(qr_centers, aligned_lidar_centers);
-    if (rmse > 0) 
-    {
-      std::cout << BOLDYELLOW << "[Result] RMSE: " << BOLDRED << std::fixed << std::setprecision(4)
-      << rmse << " m" << RESET << std::endl;
-    }
-
-    // A small aggregate 3D RMSE can still mean a visible image displacement.
-    // Report every correspondence in the same rectified pixels RViz displays.
-    std::filesystem::create_directories(params.output_path);
-    std::ofstream center_report(std::filesystem::path(params.output_path) / "center_residuals.csv");
-    center_report << "hole,lidar_x,lidar_y,lidar_z,camera_x,camera_y,camera_z,"
-        "error_x_m,error_y_m,error_z_m,error_m,error_u_px,error_v_px,error_px\n";
-    center_report << std::setprecision(10);
+    const bool lidar_valid = lidarDetectPtr->detect_lidar(cloud_input, lidar_center_cloud);
+    auto qr_centers = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    auto lidar_centers = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
+    if (lidar_valid) *lidar_centers = *lidar_center_cloud;
+    const bool calibration_valid = lidar_valid && matchPatternCenters(*lidar_centers, *qr_center_cloud,
+        params.hole_options.geometry_tolerance, params.max_mounting_rotation_deg,
+        *qr_centers, transformation);
+    auto aligned_lidar_centers = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    const Eigen::Matrix4f raw_from_standard = standardToRawLidar();
+    Eigen::Matrix4f camera_from_standard = Eigen::Matrix4f::Identity();
     const auto rectified_pixel = [&](const pcl::PointXYZ& p) {
         return cv::Point2d(params.fx * p.x / p.z + params.cx,
                            params.fy * p.y / p.z + params.cy);
     };
-    for (std::size_t i = 0; i < qr_centers->size(); ++i) {
-        const auto& raw = (*lidar_centers)[i];
-        const auto& expected = (*qr_centers)[i];
-        const auto& measured = (*aligned_lidar_centers)[i];
-        const Eigen::Vector3f delta = measured.getVector3fMap() - expected.getVector3fMap();
-        const cv::Point2d pixel_delta = rectified_pixel(measured) - rectified_pixel(expected);
-        const double pixel_error = cv::norm(pixel_delta);
-        RCLCPP_INFO(node->get_logger(), "Hole %zu residual: %.2f mm, %.2f px (du=%.2f, dv=%.2f).",
-            i + 1, delta.norm() * 1000.0, pixel_error, pixel_delta.x, pixel_delta.y);
-        center_report << i + 1 << ',' << raw.x << ',' << raw.y << ',' << raw.z << ','
-            << expected.x << ',' << expected.y << ',' << expected.z << ','
-            << delta.x() << ',' << delta.y() << ',' << delta.z() << ',' << delta.norm() << ','
-            << pixel_delta.x << ',' << pixel_delta.y << ',' << pixel_error << '\n';
+    if (calibration_valid) {
+        alignPointCloud(lidar_centers, aligned_lidar_centers, transformation);
+        camera_from_standard = transformation * raw_from_standard;
+        RCLCPP_INFO(node->get_logger(), "Calibration uses %zu observed LiDAR centers; no missing center is synthesized.",
+            lidar_centers->size());
+        const double rmse = computeRMSE(qr_centers, aligned_lidar_centers);
+        RCLCPP_INFO(node->get_logger(), "Center RMSE: %.6f m", rmse);
+        std::filesystem::create_directories(params.output_path);
+        std::ofstream report(std::filesystem::path(params.output_path) / "center_residuals.csv");
+        report << "hole,lidar_x,lidar_y,lidar_z,camera_x,camera_y,camera_z,"
+            "error_x_m,error_y_m,error_z_m,error_m,error_u_px,error_v_px,error_px\n";
+        report << std::setprecision(10);
+        for (std::size_t i = 0; i < qr_centers->size(); ++i) {
+            const auto& raw = (*lidar_centers)[i];
+            const auto& expected = (*qr_centers)[i];
+            const auto& measured = (*aligned_lidar_centers)[i];
+            const Eigen::Vector3f delta = measured.getVector3fMap() - expected.getVector3fMap();
+            const cv::Point2d pixels = rectified_pixel(measured) - rectified_pixel(expected);
+            RCLCPP_INFO(node->get_logger(), "Center %zu residual: %.2f mm, %.2f px (du=%.2f, dv=%.2f).",
+                i + 1, delta.norm() * 1000.0, cv::norm(pixels), pixels.x, pixels.y);
+            report << i + 1 << ',' << raw.x << ',' << raw.y << ',' << raw.z << ','
+                << expected.x << ',' << expected.y << ',' << expected.z << ','
+                << delta.x() << ',' << delta.y() << ',' << delta.z() << ',' << delta.norm() << ','
+                << pixels.x << ',' << pixels.y << ',' << cv::norm(pixels) << '\n';
+        }
+        std::cout << "T_cam_lidar:\n" << transformation << "\nT_cam_lidar_standard:\n"
+                  << camera_from_standard << std::endl;
+    } else {
+        RCLCPP_ERROR(node->get_logger(),
+            "Calibration failed: need %d or more rectangle corners and unambiguous camera correspondences "
+            "within %.1f degrees of the mounting. No extrinsics will be saved. Diagnostics stay active.",
+            params.hole_options.min_holes, params.max_mounting_rotation_deg);
     }
-    center_report.close();
-
-    std::cout << BOLDYELLOW << "[Result] Extrinsic parameters T_cam_lidar: " << RESET << std::endl;
-    std::cout << BOLDCYAN << std::fixed << std::setprecision(6) << transformation << RESET << std::endl;
-
-    const Eigen::Matrix4f raw_from_standard = standardToRawLidar();
-    const Eigen::Matrix4f camera_from_standard = transformation * raw_from_standard;
-    std::cout << BOLDYELLOW << "[Result] Extrinsic parameters T_cam_lidar_standard: " << RESET << std::endl;
-    std::cout << BOLDCYAN << camera_from_standard << RESET << std::endl;
 
     // Display each cloud in its actual frame. T_cam_lidar maps original
     // LiDAR coordinates into camera optical coordinates; no mounting rotation
@@ -129,10 +113,15 @@ int main(int argc, char **argv)
         tf.transform.rotation.w = q.w();
         return tf;
     };
-    tf_broadcaster->sendTransform(std::vector<geometry_msgs::msg::TransformStamped>{
-        make_tf(transformation.cast<double>(), "calib_camera_optical", "calib_lidar"),
-        make_tf(lidarDetectPtr->getBoardTransform(), "calib_lidar", "calib_board"),
-        make_tf(raw_from_standard.cast<double>(), "calib_lidar", "calib_lidar_standard")});
+    std::vector<geometry_msgs::msg::TransformStamped> transforms{
+        make_tf(raw_from_standard.cast<double>(), "calib_lidar", "calib_lidar_standard")};
+    if (lidarDetectPtr->hasBoardTransform())
+        transforms.push_back(make_tf(lidarDetectPtr->getBoardTransform(), "calib_lidar", "calib_board"));
+    if (calibration_valid)
+        transforms.push_back(make_tf(transformation.cast<double>(), "calib_camera_optical", "calib_lidar"));
+    // With no calibration the camera remains a separate frame. Never publish
+    // an identity camera/LiDAR transform that would look like a valid result.
+    tf_broadcaster->sendTransform(transforms);
 
     // Latched snapshots let RViz connect before or after computation. Publish
     // the board and centers before the expensive full-cloud projection/export.
@@ -150,7 +139,7 @@ int main(int argc, char **argv)
         publisher->publish(msg);
     };
     if (DEBUG) {
-        publish_cloud(qr_centers, qrDetectPtr->qr_pub_, "calib_camera_optical");
+        publish_cloud(qr_center_cloud, qrDetectPtr->qr_pub_, "calib_camera_optical");
         publish_cloud(lidar_centers, lidarDetectPtr->center_pub_, "calib_lidar");
         publish_cloud(lidarDetectPtr->getFilteredCloud(), lidarDetectPtr->filtered_pub_, "calib_lidar");
         publish_cloud(lidarDetectPtr->getPlaneCloud(), lidarDetectPtr->plane_pub_, "calib_lidar");
@@ -159,19 +148,32 @@ int main(int argc, char **argv)
         publish_cloud(lidarDetectPtr->getCenterZ0Cloud(), lidarDetectPtr->center_z0_pub_, "calib_board");
         publish_cloud(aligned_lidar_centers, aligned_lidar_centers_pub, "calib_camera_optical");
     }
-    RCLCPP_INFO(node->get_logger(), "Board and center snapshots ready for RViz.");
+    auto candidates_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("hole_candidates", snapshot_qos);
+    auto rejected_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("rejected_circles", snapshot_qos);
+    if (lidarDetectPtr->hasBoardTransform()) {
+        publish_cloud(lidarDetectPtr->getCandidates(), candidates_pub, "calib_board");
+        publish_cloud(lidarDetectPtr->getRejected(), rejected_pub, "calib_board");
+    }
+    RCLCPP_INFO(node->get_logger(), "Diagnostic snapshots ready for RViz (fixed frame calib_lidar).");
 
     // Full-scene verification, independent of the target ROI and image colors.
     pcl::PointCloud<pcl::PointXYZ>::Ptr scene(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::VoxelGrid<pcl::PointXYZ> scene_filter;
     scene_filter.setInputCloud(cloud_input);
     scene_filter.setLeafSize(0.01f, 0.01f, 0.01f);
-    scene_filter.filter(*scene);
+    if (!cloud_input->empty()) scene_filter.filter(*scene);
     auto scene_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
         "calibration_scene", snapshot_qos);
     publish_cloud(scene, scene_pub, "calib_lidar");
-    auto view = makeCalibrationView(img_input, qrDetectPtr->cameraMatrix_,
-        qrDetectPtr->distCoeffs_, *scene, transformation);
+    CalibrationView view;
+    if (!img_input.empty()) {
+        const pcl::PointCloud<pcl::PointXYZ> empty_scene;
+        view = makeCalibrationView(img_input, qrDetectPtr->cameraMatrix_,
+            qrDetectPtr->distCoeffs_, calibration_valid ? *scene : empty_scene, transformation);
+        if (!calibration_valid)
+            cv::putText(view.overlay, "NO CALIBRATION - IMAGE ONLY", cv::Point(25, 40),
+                cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2);
+    }
     for (std::size_t i = 0; i < qr_centers->size(); ++i) {
         const cv::Point expected = rectified_pixel((*qr_centers)[i]);
         const cv::Point measured = rectified_pixel((*aligned_lidar_centers)[i]);
@@ -186,8 +188,10 @@ int main(int argc, char **argv)
     auto overlay_pub = node->create_publisher<sensor_msgs::msg::Image>(
         "calibration_camera/overlay", snapshot_qos);
     std::function<void()> publish_camera = [image_pub, info_pub, overlay_pub, clock = node->get_clock(),
-        image = *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", view.rectified).toImageMsg(),
-        overlay = *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", view.overlay).toImageMsg(),
+        image = view.rectified.empty() ? sensor_msgs::msg::Image() :
+            *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", view.rectified).toImageMsg(),
+        overlay = view.overlay.empty() ? sensor_msgs::msg::Image() :
+            *cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", view.overlay).toImageMsg(),
         info = view.info]() mutable {
         info.header.stamp = clock->now();
         info.header.frame_id = "calib_camera_optical";
@@ -197,10 +201,18 @@ int main(int argc, char **argv)
         image_pub->publish(image);
         overlay_pub->publish(overlay);
     };
-    publish_camera();
+    if (!img_input.empty()) publish_camera();
     // CameraInfo subscribers may be volatile; repeat snapshots for late viewers.
-    auto camera_timer = node->create_wall_timer(std::chrono::seconds(1), publish_camera);
+    auto camera_timer = node->create_wall_timer(std::chrono::seconds(1), [&]() {
+        if (!img_input.empty()) publish_camera();
+    });
     RCLCPP_INFO(node->get_logger(), "Camera verification ready: %zu projected pixels.", view.projected_pixels);
+    if (!calibration_valid) {
+        RCLCPP_WARN(node->get_logger(), "Image shown separately; camera overlay unavailable without extrinsics. Ctrl+C to exit diagnostics.");
+        if (rclcpp::ok()) rclcpp::spin(node);
+        rclcpp::shutdown();
+        return 1;
+    }
     std::filesystem::create_directories(params.output_path);
     cv::imwrite((std::filesystem::path(params.output_path) / "projection_overlay.png").string(), view.overlay);
 

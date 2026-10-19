@@ -31,6 +31,7 @@ which is included as part of this source code package.
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "color.h"
+#include "lidar_holes.h"
 #include <rclcpp/rclcpp.hpp>
 
 using namespace std;
@@ -47,6 +48,8 @@ struct Params {
   double fx, fy, cx, cy, k1, k2, p1, p2, k3;
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius;
+  lidar_holes::Options hole_options;
+  double boundary_search_radius, edge_cluster_tolerance, max_mounting_rotation_deg;
   int min_points_per_voxel;
   double plane_distance_threshold;
   int min_detected_markers;
@@ -90,8 +93,33 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
   node->declare_parameter("z_min", -0.5);
   node->declare_parameter("z_max", 2.0);
 
+  node->declare_parameter("min_lidar_holes", 3);
+  node->declare_parameter("circle_min_inliers", 20);
+  node->declare_parameter("circle_fit_distance", 0.01);
+  node->declare_parameter("circle_radius_tolerance", 0.02);
+  node->declare_parameter("hole_geometry_tolerance", 0.03);
+  node->declare_parameter("hole_max_interior_density", 0.05);
+  node->declare_parameter("hole_max_interior_points", 2);
+  node->declare_parameter("hole_min_surround_sectors", 6);
+  node->declare_parameter("hole_max_angular_gap_deg", 180.0);
+  node->declare_parameter("boundary_search_radius", 0.0);
+  node->declare_parameter("edge_cluster_tolerance", 0.0);
+  node->declare_parameter("max_mounting_rotation_deg", 45.0);
+
   // Get parameter values with error handling
   try {
+    params.hole_options.min_holes = node->get_parameter("min_lidar_holes").as_int();
+    params.hole_options.min_inliers = node->get_parameter("circle_min_inliers").as_int();
+    params.hole_options.fit_distance = node->get_parameter("circle_fit_distance").as_double();
+    params.hole_options.radius_tolerance = node->get_parameter("circle_radius_tolerance").as_double();
+    params.hole_options.geometry_tolerance = node->get_parameter("hole_geometry_tolerance").as_double();
+    params.hole_options.max_interior_density = node->get_parameter("hole_max_interior_density").as_double();
+    params.hole_options.max_interior_points = node->get_parameter("hole_max_interior_points").as_int();
+    params.hole_options.min_surround_sectors = node->get_parameter("hole_min_surround_sectors").as_int();
+    params.hole_options.max_angular_gap_deg = node->get_parameter("hole_max_angular_gap_deg").as_double();
+    params.boundary_search_radius = node->get_parameter("boundary_search_radius").as_double();
+    params.edge_cluster_tolerance = node->get_parameter("edge_cluster_tolerance").as_double();
+    params.max_mounting_rotation_deg = node->get_parameter("max_mounting_rotation_deg").as_double();
     params.fx = node->get_parameter("fx").as_double();
     params.fy = node->get_parameter("fy").as_double();
     params.cx = node->get_parameter("cx").as_double();
@@ -125,6 +153,20 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
     throw;
   }
   
+  const auto& h = params.hole_options;
+  if ((h.min_holes != 3 && h.min_holes != 4) || h.min_inliers < 3 ||
+      !std::isfinite(h.fit_distance) || h.fit_distance <= 0 ||
+      !std::isfinite(h.radius_tolerance) || h.radius_tolerance <= 0 ||
+      !std::isfinite(h.geometry_tolerance) || h.geometry_tolerance <= 0 ||
+      !std::isfinite(h.max_interior_density) || h.max_interior_density < 0 || h.max_interior_density >= 1 ||
+      h.max_interior_points < 0 || h.min_surround_sectors < 1 || h.min_surround_sectors > 8 ||
+      !std::isfinite(h.max_angular_gap_deg) || h.max_angular_gap_deg <= 0 || h.max_angular_gap_deg > 360 ||
+      !std::isfinite(params.boundary_search_radius) || params.boundary_search_radius < 0 ||
+      !std::isfinite(params.edge_cluster_tolerance) || params.edge_cluster_tolerance < 0 ||
+      !std::isfinite(params.max_mounting_rotation_deg) || params.max_mounting_rotation_deg <= 0 ||
+      params.max_mounting_rotation_deg >= 90)
+    throw std::invalid_argument("Invalid hole detection parameters (min_lidar_holes must be 3 or 4; mounting angle must be below 90 degrees)");
+
   // Log loaded parameters for debugging
   RCLCPP_INFO(node->get_logger(), "Loaded parameters:");
   RCLCPP_INFO(node->get_logger(), "  Camera: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f", 

@@ -8,7 +8,7 @@ Visualization Manager:
   Enabled: true
   Name: root
   Global Options:
-    Fixed Frame: calib_camera_optical
+    Fixed Frame: calib_lidar
     Frame Rate: 30
     Background Color: 32; 32; 32
   Displays:
@@ -21,8 +21,8 @@ Visualization Manager:
     Marker Scale: 0.2
   - Class: rviz_default_plugins/PointCloud2
     Name: Board returns
-    Enabled: false
-    Value: false
+    Enabled: true
+    Value: true
     Topic:
       Depth: 1
       Durability Policy: Transient Local
@@ -97,8 +97,8 @@ Visualization Manager:
     Use Fixed Frame: true
   - Class: rviz_default_plugins/PointCloud2
     Name: Hole boundaries
-    Enabled: false
-    Value: false
+    Enabled: true
+    Value: true
     Topic:
       Depth: 1
       Durability Policy: Transient Local
@@ -159,8 +159,8 @@ Visualization Manager:
     Use Fixed Frame: true
   - Class: rviz_default_plugins/Camera
     Name: Camera view
-    Enabled: true
-    Value: true
+    Enabled: false
+    Value: false
     Topic:
       Depth: 1
       Durability Policy: Transient Local
@@ -187,6 +187,57 @@ Visualization Manager:
       History Policy: Keep Last
       Reliability Policy: Reliable
       Value: /calibration_camera/overlay
+    Normalize Range: true
+    Min Value: 0
+    Max Value: 1
+  - Class: rviz_default_plugins/PointCloud2
+    Enabled: true
+    Value: true
+    Position Transformer: XYZ
+    Color Transformer: FlatColor
+    Alpha: 1
+    Size (Pixels): 5
+    Size (m): 0.025
+    Style: Spheres
+    Decay Time: 0
+    Use Fixed Frame: true
+    Name: Hole candidates
+    Color: 255; 220; 0
+    Topic:
+      Depth: 1
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /hole_candidates
+  - Class: rviz_default_plugins/PointCloud2
+    Enabled: true
+    Value: true
+    Position Transformer: XYZ
+    Color Transformer: FlatColor
+    Alpha: 1
+    Size (Pixels): 5
+    Size (m): 0.025
+    Style: Spheres
+    Decay Time: 0
+    Use Fixed Frame: true
+    Name: Rejected circles
+    Color: 255; 0; 200
+    Topic:
+      Depth: 1
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /rejected_circles
+  - Class: rviz_default_plugins/Image
+    Name: Camera image
+    Enabled: true
+    Value: true
+    Topic:
+      Depth: 1
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /calibration_camera/image_rect
     Normalize Range: true
     Min Value: 0
     Max Value: 1
