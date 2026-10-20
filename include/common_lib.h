@@ -23,6 +23,7 @@ which is included as part of this source code package.
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/registration/transformation_estimation_svd.h>
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -41,6 +42,24 @@ using namespace pcl;
 #define TARGET_NUM_CIRCLES 4
 #define DEBUG 1
 #define GEOMETRY_TOLERANCE 0.06
+
+// A plane has no unique yaw. Report the rotation Rz(0)*Ry(pitch)*Rx(roll)
+// taking +Z to its normal, with a consistent normal sign in each sensor frame.
+inline void logPlaneOrientation(const rclcpp::Logger& logger, const char* sensor,
+                                const char* frame, Eigen::Vector3d normal)
+{
+  if (!normal.allFinite() || normal.norm() < 1e-6) return;
+  normal.normalize();
+  if (normal.z() < 0.0) normal = -normal;
+  const double degrees = 180.0 / std::acos(-1.0);
+  const double roll = -std::asin(std::clamp(normal.y(), -1.0, 1.0)) * degrees;
+  const double pitch = std::atan2(normal.x(), normal.z()) * degrees;
+  const double tilt = std::acos(std::clamp(normal.z(), -1.0, 1.0)) * degrees;
+  RCLCPP_INFO(logger,
+      "%s board plane [%s]: normal=[%.6f, %.6f, %.6f], tilt_to_+Z=%.4f deg, "
+      "normal_rpy_deg=[%.4f, %.4f, 0.0000] (yaw fixed to 0).",
+      sensor, frame, normal.x(), normal.y(), normal.z(), tilt, roll, pitch);
+}
 
 // Parameters structure
 struct Params {

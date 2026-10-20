@@ -268,6 +268,8 @@ class QRDetect
         // Build transformation matrix to calibration target axis
         cv::Mat R;
         cv::Rodrigues(rvec, R);
+        logPlaneOrientation(node_->get_logger(), "Camera", "calib_camera_optical",
+            Eigen::Vector3d(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2)));
 
         cv::Mat t = cv::Mat::zeros(3, 1, CV_64F);
         t.at<double>(0) = tvec[0];

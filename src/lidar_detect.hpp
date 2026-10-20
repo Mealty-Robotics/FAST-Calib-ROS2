@@ -168,6 +168,7 @@ public:
             return false;
         }
         normal.normalize();
+        logPlaneOrientation(node_->get_logger(), "LiDAR", "calib_lidar", normal);
         const Eigen::Matrix3d R = Eigen::Quaterniond::FromTwoVectors(
             normal, Eigen::Vector3d::UnitZ()).toRotationMatrix();
 
