@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <pcl/filters/voxel_grid.h>
+#include "plane_fit.h"
 #include "common_lib.h"
 #include "lidar_holes.h"
 
@@ -150,6 +151,18 @@ public:
             return false;
         }
 
+        board_plane::Fit refined_plane;
+        const Eigen::Vector4d initial_plane(plane_coefficients->values[0],
+            plane_coefficients->values[1], plane_coefficients->values[2], plane_coefficients->values[3]);
+        if (!board_plane::refine(*filtered_cloud_, initial_plane, plane_distance_threshold_, refined_plane)) {
+            RCLCPP_ERROR(node_->get_logger(), "Board plane refinement failed to converge to a valid plane.");
+            return false;
+        }
+        plane_inliers->indices = refined_plane.inliers;
+        RCLCPP_INFO(node_->get_logger(),
+            "Board plane refined over all cropped voxels: %d iterations, normal change %.4f deg.",
+            refined_plane.iterations, refined_plane.initial_normal_change_deg);
+
         pcl::ExtractIndices<pcl::PointXYZ> extract;
         extract.setInputCloud(filtered_cloud_);
         extract.setIndices(plane_inliers);
@@ -160,9 +173,7 @@ public:
         aligned_cloud_->clear();
         aligned_cloud_->reserve(plane_cloud_->size());
 
-        Eigen::Vector3d normal(plane_coefficients->values[0],
-            plane_coefficients->values[1],
-            plane_coefficients->values[2]);
+        Eigen::Vector3d normal = refined_plane.normal;
         if (!normal.allFinite() || normal.norm() < 1e-6) {
             RCLCPP_ERROR(node_->get_logger(), "Invalid calibration board normal.");
             return false;
@@ -173,16 +184,14 @@ public:
             normal, Eigen::Vector3d::UnitZ()).toRotationMatrix();
 
         // 应用旋转矩阵，将平面对齐到 Z=0 平面
-        double average_z = 0.0;
-        int cnt = 0;
+        // Use the fitted plane itself, not an unweighted mean of its final
+        // thresholded points, for the depth of reconstructed hole centers.
+        const double average_z = -refined_plane.offset;
         for (const auto& pt : *plane_cloud_) {
             Eigen::Vector3d point(pt.x, pt.y, pt.z);
             Eigen::Vector3d aligned_point = R * point;
             aligned_cloud_->push_back(pcl::PointXYZ(aligned_point.x(), aligned_point.y(), 0.0));
-            average_z += aligned_point.z();
-            cnt++;
         }
-        average_z /= cnt;
         board_transform_.setIdentity();
         board_transform_.block<3, 3>(0, 0) = R.transpose();
         board_transform_.block<3, 1>(0, 3) = R.transpose() * Eigen::Vector3d(0.0, 0.0, average_z);
