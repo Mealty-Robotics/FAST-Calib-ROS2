@@ -29,6 +29,7 @@ class QRDetect
     double marker_size_, delta_width_qr_center_, delta_height_qr_center_;
     double delta_width_circles_, delta_height_circles_;
     int min_detected_markers_;
+    double max_reprojection_rmse_;
     cv::Ptr<cv::aruco::Dictionary> dictionary_;
     std::shared_ptr<rclcpp::Node> node_;
   
@@ -47,6 +48,7 @@ class QRDetect
       delta_width_circles_ = params.delta_width_circles;
       delta_height_circles_ = params.delta_height_circles;
       min_detected_markers_ = params.min_detected_markers;
+      max_reprojection_rmse_ = params.max_camera_reprojection_rmse;
       
       // Initialize camera matrix
       cameraMatrix_ = (cv::Mat_<double>(3, 3) << params.fx, 0, params.cx,
@@ -260,8 +262,15 @@ class QRDetect
             ++corner_count;
           }
         }
-        RCLCPP_INFO(node_->get_logger(), "ArUco corner reprojection RMSE: %.3f px (%zu corners).",
-            std::sqrt(corner_error_squared / corner_count), corner_count);
+        const double corner_rmse = corner_count ? std::sqrt(corner_error_squared / corner_count) :
+            std::numeric_limits<double>::infinity();
+        RCLCPP_INFO(node_->get_logger(), "ArUco corner reprojection RMSE: %.3f px (%zu corners; limit %.3f px).",
+            corner_rmse, corner_count, max_reprojection_rmse_);
+        if (!std::isfinite(corner_rmse) || corner_rmse > max_reprojection_rmse_) {
+          RCLCPP_ERROR(node_->get_logger(), "Camera board pose rejected: corner reprojection RMSE exceeds %.3f px.",
+              max_reprojection_rmse_);
+          return;
+        }
 
         cv::drawFrameAxes(imageCopy_, cameraMatrix_, distCoeffs_, rvec, tvec, 0.2);
 

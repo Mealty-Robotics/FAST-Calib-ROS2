@@ -10,9 +10,13 @@
 // resolved using the known mounting (+Z forward, +X down, +Y left).
 inline bool matchPatternCenters(const lidar_holes::Cloud& lidar,
     const lidar_holes::Cloud& camera, double tolerance, double max_mounting_degrees,
-    lidar_holes::Cloud& matched_camera, Eigen::Matrix4f& camera_from_lidar)
+    lidar_holes::Cloud& matched_camera, Eigen::Matrix4f& camera_from_lidar,
+    double max_rmse = 0.005, double* best_rmse = nullptr)
 {
     matched_camera.clear();
+    camera_from_lidar.setIdentity();
+    if (best_rmse) *best_rmse = std::numeric_limits<double>::infinity();
+    if (!std::isfinite(max_rmse) || max_rmse <= 0.0) return false;
     if ((lidar.size() != 3 && lidar.size() != 4) || camera.size() != 4)
         return false;
     Eigen::Matrix3f nominal;
@@ -51,7 +55,13 @@ inline bool matchPatternCenters(const lidar_holes::Cloud& lidar,
             camera_from_lidar = transform;
         }
     } while (std::next_permutation(assignment.begin(), assignment.end()));
-    return std::isfinite(best);
+    if (best_rmse) *best_rmse = std::sqrt(best);
+    if (!std::isfinite(best) || best > max_rmse * max_rmse) {
+        matched_camera.clear();
+        camera_from_lidar.setIdentity();
+        return false;
+    }
+    return true;
 }
 
 #endif

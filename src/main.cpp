@@ -49,9 +49,13 @@ int main(int argc, char **argv)
     auto lidar_centers = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
     if (lidar_valid) *lidar_centers = *lidar_center_cloud;
+    double best_center_rmse = std::numeric_limits<double>::infinity();
     const bool calibration_valid = lidar_valid && matchPatternCenters(*lidar_centers, *qr_center_cloud,
         params.hole_options.geometry_tolerance, params.max_mounting_rotation_deg,
-        *qr_centers, transformation);
+        *qr_centers, transformation, params.max_calibration_rmse, &best_center_rmse);
+    if (!calibration_valid && std::isfinite(best_center_rmse))
+        RCLCPP_ERROR(node->get_logger(), "Calibration rejected: best center RMSE %.2f mm exceeds limit %.2f mm.",
+            best_center_rmse * 1000.0, params.max_calibration_rmse * 1000.0);
     auto aligned_lidar_centers = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     const Eigen::Matrix4f raw_from_standard = standardToRawLidar();
     Eigen::Matrix4f camera_from_standard = Eigen::Matrix4f::Identity();
@@ -89,8 +93,10 @@ int main(int argc, char **argv)
     } else {
         RCLCPP_ERROR(node->get_logger(),
             "Calibration failed: need %d or more rectangle corners and unambiguous camera correspondences "
-            "within %.1f degrees of the mounting. No extrinsics will be saved. Diagnostics stay active.",
-            params.hole_options.min_holes, params.max_mounting_rotation_deg);
+            "within %.1f degrees of the mounting, center RMSE <= %.2f mm and camera RMSE <= %.2f px. "
+            "No extrinsics will be saved. Diagnostics stay active.",
+            params.hole_options.min_holes, params.max_mounting_rotation_deg,
+            params.max_calibration_rmse * 1000.0, params.max_camera_reprojection_rmse);
     }
 
     // Display each cloud in its actual frame. T_cam_lidar maps original

@@ -69,6 +69,7 @@ struct Params {
   double delta_width_circles, delta_height_circles, circle_radius;
   lidar_holes::Options hole_options;
   double boundary_search_radius, edge_cluster_tolerance, max_mounting_rotation_deg;
+  double max_calibration_rmse, max_camera_reprojection_rmse;
   int min_points_per_voxel;
   double plane_distance_threshold;
   int min_detected_markers;
@@ -124,6 +125,9 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
   node->declare_parameter("boundary_search_radius", 0.0);
   node->declare_parameter("edge_cluster_tolerance", 0.0);
   node->declare_parameter("max_mounting_rotation_deg", 45.0);
+  node->declare_parameter("hole_max_center_shift", 0.005);
+  node->declare_parameter("max_calibration_rmse", 0.005);
+  node->declare_parameter("max_camera_reprojection_rmse", 2.0);
 
   // Get parameter values with error handling
   try {
@@ -139,6 +143,9 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
     params.boundary_search_radius = node->get_parameter("boundary_search_radius").as_double();
     params.edge_cluster_tolerance = node->get_parameter("edge_cluster_tolerance").as_double();
     params.max_mounting_rotation_deg = node->get_parameter("max_mounting_rotation_deg").as_double();
+    params.hole_options.max_center_shift = node->get_parameter("hole_max_center_shift").as_double();
+    params.max_calibration_rmse = node->get_parameter("max_calibration_rmse").as_double();
+    params.max_camera_reprojection_rmse = node->get_parameter("max_camera_reprojection_rmse").as_double();
     params.fx = node->get_parameter("fx").as_double();
     params.fy = node->get_parameter("fy").as_double();
     params.cx = node->get_parameter("cx").as_double();
@@ -180,6 +187,9 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
       !std::isfinite(h.max_interior_density) || h.max_interior_density < 0 || h.max_interior_density >= 1 ||
       h.max_interior_points < 0 || h.min_surround_sectors < 1 || h.min_surround_sectors > 8 ||
       !std::isfinite(h.max_angular_gap_deg) || h.max_angular_gap_deg <= 0 || h.max_angular_gap_deg > 360 ||
+      !std::isfinite(h.max_center_shift) || h.max_center_shift <= 0 ||
+      !std::isfinite(params.max_calibration_rmse) || params.max_calibration_rmse <= 0 ||
+      !std::isfinite(params.max_camera_reprojection_rmse) || params.max_camera_reprojection_rmse <= 0 ||
       !std::isfinite(params.boundary_search_radius) || params.boundary_search_radius < 0 ||
       !std::isfinite(params.edge_cluster_tolerance) || params.edge_cluster_tolerance < 0 ||
       !std::isfinite(params.max_mounting_rotation_deg) || params.max_mounting_rotation_deg <= 0 ||

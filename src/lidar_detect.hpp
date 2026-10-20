@@ -247,11 +247,12 @@ public:
             pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
             for (const auto index : indices.indices)
                 cluster->push_back(edge_cloud_->points[index]);
-            lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, circle_candidates, &search_stats, options_);
+            lidar_holes::extractCandidates(cluster, *aligned_cloud_, circle_radius_, circle_candidates,
+                &search_stats, options_, edge_cloud_.get());
         }
         // Keep every validated fit for geometry selection. Nearby fits are
         // alternative center hypotheses, not interchangeable measurements:
-        // radius error alone cannot decide which belongs to the rectangle.
+        // fit error alone cannot decide which belongs to the rectangle.
         lidar_holes::Cloud hypotheses;
         for (const auto& candidate : circle_candidates)
             hypotheses.push_back(candidate.center);
@@ -262,9 +263,10 @@ public:
         *rejected_ = search_stats.rejected_centers;
         RCLCPP_INFO(node_->get_logger(),
             "Circle search: %zu fits, %zu rejected for radius/error, %zu for interior/surround support, "
-            "%zu for partial arcs, %zu nearby alternatives, %zu distinct candidates (radius %.3f m).",
+            "%zu for partial arcs, %zu for unstable centers, %zu nearby alternatives, %zu distinct candidates (radius %.3f m).",
             search_stats.fits, search_stats.rejected_radius, search_stats.rejected_interior,
-            search_stats.rejected_coverage, search_stats.rejected_duplicate, candidates.size(), circle_radius_);
+            search_stats.rejected_coverage, search_stats.rejected_stability,
+            search_stats.rejected_duplicate, candidates.size(), circle_radius_);
 
         if (!lidar_holes::selectTarget(hypotheses, target_width_, target_height_,
                                       circle_radius_, *center_z0_cloud_, options_)) {
@@ -276,7 +278,7 @@ public:
             for (std::size_t i = 0; i < circle_candidates.size(); ++i) {
                 const auto& candidate = circle_candidates[i];
                 RCLCPP_INFO(node_->get_logger(),
-                    "Hole hypothesis %zu: board XY=(%.4f, %.4f) m, radius error=%.4f m, support=%zu.",
+                    "Hole hypothesis %zu: board XY=(%.4f, %.4f) m, rim RMSE=%.4f m, support=%zu.",
                     i + 1, candidate.center.x, candidate.center.y, candidate.error, candidate.support);
             }
             const std::array<double, 3> expected{{std::min(target_width_, target_height_),
@@ -309,6 +311,22 @@ public:
                     best_lengths[0], best_lengths[1], best_lengths[2], expected[0], expected[1], expected[2],
                     best_error, options_.geometry_tolerance);
             return false;
+        }
+
+        for (std::size_t i = 0; i < center_z0_cloud_->size(); ++i) {
+            const auto& center = (*center_z0_cloud_)[i];
+            const auto found = std::min_element(circle_candidates.begin(), circle_candidates.end(),
+                [&](const auto& a, const auto& b) {
+                    return lidar_holes::distance(a.center, center) < lidar_holes::distance(b.center, center);
+                });
+            RCLCPP_INFO(node_->get_logger(),
+                "Hole %zu: %zu merged edge points, fixed radius %.4f m, rim RMSE %.2f mm, "
+                "max gap %.1f deg, leave-one-sector-out center shift %.2f mm (limit %.2f mm).",
+                i + 1, found->support, circle_radius_, found->error * 1000.0,
+                found->max_gap_deg, found->center_shift * 1000.0, options_.max_center_shift * 1000.0);
+            for (std::size_t j = 0; j < i; ++j)
+                RCLCPP_INFO(node_->get_logger(), "LiDAR holes %zu <-> %zu: %.4f m.",
+                    j + 1, i + 1, lidar_holes::distance((*center_z0_cloud_)[j], center));
         }
 
         // Commit only a complete, validated target to the output cloud.
